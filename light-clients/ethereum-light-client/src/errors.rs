@@ -66,6 +66,15 @@ pub enum Error {
     #[error("verify storage proof error")]
     VerifyStorageProof(#[source] ethereum_verifier::error::Error),
 
+    #[error("verify storage proof error: {1} {2} {3} {4}")]
+    TestVerifyStorageProof(
+        #[source] ethereum_verifier::error::Error,
+        String,
+        String,
+        String,
+        String,
+    ),
+
     #[error("IBC path is empty")]
     EmptyIbcPath,
 

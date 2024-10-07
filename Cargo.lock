@@ -4016,6 +4016,7 @@ dependencies = [
  "serde-json-wasm 1.0.1",
  "serde-utils",
  "serde_json",
+ "sha2 0.10.8",
  "sha3",
  "thiserror",
  "tiny-keccak",

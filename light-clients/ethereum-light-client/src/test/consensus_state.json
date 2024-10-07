@@ -1,10 +1,10 @@
 {
   "data": {
-    "slot": 3577152,
-    "state_root": "0x362c490a956b08e1593eaa162493a5a8a0ea7c363a556340e67db359d000f334",
-    "storage_root": "0x362c490a956b08e1593eaa162493a5a8a0ea7c363a556340e67db359d000f335",
-    "timestamp": 1697538180,
-    "current_sync_committee": "0xa8a2170aef4f2d23e9fd272cd0e65b3d98f9ce1cc0eb0df75876d7754b69add47c19b00fc9332de2a16d3c4075360912",
-    "next_sync_committee": "0xa210dc22d065f947f26edccf82d3c2886ad51c2241d8b67636fa3e5c5ec67f7e016c288b25bfa9ebdcb9682e76212a6c"
+    "slot": 5332,
+    "state_root": "0x8ec976c4d04ee6f0e02417ec6ec5ed8a35ed517667a9985a39f1f67aacc1b73e",
+    "storage_root": "0x10308a351689a587547d650cf46bfa13f0cf3423555310ab7ec048d8df5085a8",
+    "timestamp": 1728247613000000000,
+    "current_sync_committee": "0x970c6bfa248ec03db36b19ae8387f93d4adfe686f8ac7a97d36a63dec4c18bdfd6c0a886c81fe6c492e461a98e6e4ec3",
+    "next_sync_committee": "0x970c6bfa248ec03db36b19ae8387f93d4adfe686f8ac7a97d36a63dec4c18bdfd6c0a886c81fe6c492e461a98e6e4ec3"
   }
 }

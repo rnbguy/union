@@ -49,6 +49,11 @@ pub fn ibc_commitment_key(path: &str, slot: U256) -> U256 {
     Slot::Mapping(&Slot::Offset(slot), MappingKey::Bytes32(keccak256(path))).slot()
 }
 
+#[must_use = "calculating the commitment key has no effect"]
+pub fn ibc_commitment_key_v2(path: Vec<u8>, slot: U256) -> U256 {
+    Slot::Mapping(&Slot::Offset(slot), MappingKey::Bytes32(keccak256(path))).slot()
+}
+
 // REVIEW: Is this needed? Currently unused
 pub const BLOCK_BODY_EXECUTION_PAYLOAD_INDEX: usize = 9;
 

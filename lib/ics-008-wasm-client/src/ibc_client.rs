@@ -6,10 +6,7 @@ use unionlabs::{
     encoding::{Decode, DecodeAs, DecodeErrorOf, Encode, Encoding, Proto},
     google::protobuf::any::Any,
     ibc::{
-        core::{
-            client::{genesis_metadata::GenesisMetadata, height::Height},
-            commitment::merkle_path::MerklePath,
-        },
+        core::client::{genesis_metadata::GenesisMetadata, height::Height},
         lightclients::wasm,
     },
 };
@@ -115,7 +112,7 @@ pub trait IbcClient: Sized {
                 delay_time_period,
                 delay_block_period,
                 proof.into(),
-                path,
+                path.into_iter().map(|binary| binary.into()).collect(),
                 StorageState::Occupied(value.into()),
             )?),
             SudoMsg::VerifyNonMembership {
@@ -130,7 +127,7 @@ pub trait IbcClient: Sized {
                 delay_time_period,
                 delay_block_period,
                 proof.into(),
-                path,
+                path.into_iter().map(|binary| binary.into()).collect(),
                 StorageState::Empty,
             )?),
             SudoMsg::UpdateState { client_message } => {
@@ -231,7 +228,7 @@ pub trait IbcClient: Sized {
         delay_time_period: u64,
         delay_block_period: u64,
         proof: Vec<u8>,
-        path: MerklePath,
+        path: Vec<Vec<u8>>,
         value: StorageState,
     ) -> Result<(), IbcClientError<Self>>;
 

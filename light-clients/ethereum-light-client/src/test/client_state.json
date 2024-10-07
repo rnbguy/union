@@ -1,43 +1,43 @@
 {
   "data": {
-    "chain_id": "11155111",
-    "genesis_validators_root": "0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078",
+    "chain_id": "17000",
+    "genesis_validators_root": "0xd61ea484febacfae5298d52a2b581f3e305a51f3112a9241b968dccf019f7b11",
     "min_sync_committee_participants": 0,
-    "genesis_time": 1655733600,
+    "genesis_time": 1728183629,
     "fork_parameters": {
-      "genesis_fork_version": "0x90000069",
+      "genesis_fork_version": "0x10000038",
       "genesis_slot": 0,
       "altair": {
-        "version": "0x90000070",
-        "epoch": 50
+        "version": "0x20000038",
+        "epoch": 0
       },
       "bellatrix": {
-        "version": "0x90000071",
-        "epoch": 100
+        "version": "0x30000038",
+        "epoch": 0
       },
       "capella": {
-        "version": "0x90000072",
-        "epoch": 56832
+        "version": "0x40000038",
+        "epoch": 0
       },
       "deneb": {
-        "version": "0x04000000",
-        "epoch": 18446744073709551615
+        "version": "0x50000038",
+        "epoch": 0
       }
     },
-    "seconds_per_slot": 12,
+    "seconds_per_slot": 12000000000,
     "slots_per_epoch": 32,
     "epochs_per_sync_committee_period": 256,
-    "latest_slot": 3577184,
+    "latest_slot": 5332,
     "frozen_height": {
       "revision_number": 0,
       "revision_height": 0
     },
     "ibc_commitment_slot": "0",
-    "ibc_contract_address": "0x971a9631b0a4e0e78954c764c7060e9d95d5cfd6"
+    "ibc_contract_address": "0xC3536F63aB92bc7902dB5D57926c80f933121Bca"
   },
-  "checksum": "0xfa19d6ccbe4bde2d6a205136e65089460c4d9781a918add0e9dd3a0b9a2d73cb",
+  "checksum": "0x446a0bad1a6f8a4534c1cb5f7416e3a1242e0588d780c2a03f6507eb19ec3d43",
   "latest_height": {
     "revision_number": 0,
-    "revision_height": 3577152
+    "revision_height": 5332
   }
 }

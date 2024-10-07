@@ -2,10 +2,7 @@ use std::fmt::Display;
 
 use cosmwasm_std::Binary;
 use serde::{Deserialize, Serialize};
-use unionlabs::ibc::core::{
-    client::{genesis_metadata::GenesisMetadata, height::Height},
-    commitment::merkle_path::MerklePath,
-};
+use unionlabs::ibc::core::client::{genesis_metadata::GenesisMetadata, height::Height};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstantiateMsg {
@@ -55,7 +52,7 @@ pub enum SudoMsg {
         delay_time_period: u64,
         delay_block_period: u64,
         proof: Binary,
-        path: MerklePath,
+        path: Vec<Binary>,
         value: Binary,
     },
 
@@ -64,7 +61,7 @@ pub enum SudoMsg {
         delay_time_period: u64,
         delay_block_period: u64,
         proof: Binary,
-        path: MerklePath,
+        path: Vec<Binary>,
     },
     UpdateState {
         client_message: Binary,
