@@ -7,7 +7,7 @@ pub mod custom_query;
 pub mod errors;
 
 #[cfg(feature = "mainnet")]
-pub use unionlabs::ethereum::config::Mainnet as Config;
+pub use unionlabs::ethereum::config::Minimal as Config;
 #[cfg(feature = "minimal")]
 pub use unionlabs::ethereum::config::Minimal as Config;
 
