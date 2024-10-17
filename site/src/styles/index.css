@@ -1,3 +1,5 @@
+@import url("../../node_modules/katex/dist/katex.min.css");
+
 pre,
 figure,
 .expressive-code {
@@ -115,8 +117,8 @@ code[data-line-numbers] > [data-line]::before {
 }
 
 [data-chars-id] {
-  box-shadow: var(--tw-ring-offset-shadow, 0 0 #0000),
-    var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow) !important;
+  box-shadow: var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000),
+    var(--tw-shadow) !important;
   padding: 0.25rem;
   border-bottom-width: 2px;
 }

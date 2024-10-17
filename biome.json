@@ -1,5 +1,5 @@
 {
-  "$schema": "https://esm.sh/@biomejs/biome@1.8.3/configuration_schema.json",
+  "$schema": "https://biomejs.dev/schemas/1.9.3/schema.json",
   "vcs": {
     "enabled": true,
     "clientKind": "git",
@@ -14,12 +14,17 @@
       "*.cjs",
       "*.jsx",
       "*.tsx",
-      "*.vue",
       "*.d.ts",
+      "*.d.mts",
+      "*.d.cts",
+      "*.vue",
+      "*.html",
+      "*.css",
       "*.json",
       "*.jsonc",
       "*.astro",
-      "*.svelte"
+      "*.svelte",
+      "*.graphql"
     ],
     "ignore": [
       "_",
@@ -29,12 +34,18 @@
       ".sqlx",
       "result",
       "vendor",
+      ".vercel",
       "testdata",
       "generated",
       ".svelte-kit",
       "node_modules",
+      "light-clients/**",
       "package-lock.json",
+      "networks/genesis/**",
       "./app/src/generated",
+      "lib/scroll-verifier/**",
+      "lib/ethereum-verifier/**",
+      "lib/tendermint-verifier/**",
       "./lib/poseidon-rs/constants.json"
     ]
   },
@@ -46,11 +57,25 @@
       "enabled": true,
       "indentWidth": 2,
       "lineWidth": 100,
-      "quoteStyle": "single",
+      "quoteStyle": "double",
       "indentStyle": "space"
     },
     "parser": {
+      "cssModules": true,
       "allowWrongLineComments": true
+    }
+  },
+  "graphql": {
+    "formatter": {
+      "enabled": true,
+      "lineWidth": 100,
+      "indentWidth": 2,
+      "bracketSpacing": true,
+      "indentStyle": "space",
+      "quoteStyle": "double"
+    },
+    "linter": {
+      "enabled": true
     }
   },
   "files": {
@@ -58,16 +83,23 @@
     "include": [
       "*.ts",
       "*.mts",
+      "*.cts",
       "*.js",
+      "*.mjs",
       "*.cjs",
       "*.jsx",
       "*.tsx",
       "*.d.ts",
+      "*.d.mts",
+      "*.d.cts",
       "*.vue",
+      "*.html",
+      "*.css",
       "*.json",
       "*.jsonc",
       "*.astro",
-      "*.svelte"
+      "*.svelte",
+      "*.graphql"
     ],
     "ignoreUnknown": true,
     "ignore": [
@@ -78,12 +110,18 @@
       ".sqlx",
       "result",
       "vendor",
+      ".vercel",
       "testdata",
       "generated",
       ".svelte-kit",
       "node_modules",
+      "light-clients/**",
       "package-lock.json",
+      "networks/genesis/**",
       "./app/src/generated",
+      "lib/scroll-verifier/**",
+      "lib/ethereum-verifier/**",
+      "lib/tendermint-verifier/**",
       "./lib/poseidon-rs/constants.json"
     ]
   },
@@ -109,16 +147,23 @@
     "include": [
       "*.ts",
       "*.mts",
+      "*.cts",
       "*.js",
+      "*.mjs",
       "*.cjs",
       "*.jsx",
       "*.tsx",
       "*.d.ts",
+      "*.d.mts",
+      "*.d.cts",
       "*.vue",
+      "*.html",
+      "*.css",
       "*.json",
       "*.jsonc",
       "*.astro",
-      "*.svelte"
+      "*.svelte",
+      "*.graphql"
     ],
     "ignore": [
       "_",
@@ -128,12 +173,18 @@
       ".sqlx",
       "result",
       "vendor",
+      ".vercel",
       "testdata",
       "generated",
       ".svelte-kit",
       "node_modules",
+      "light-clients/**",
       "package-lock.json",
+      "networks/genesis/**",
       "./app/src/generated",
+      "lib/scroll-verifier/**",
+      "lib/ethereum-verifier/**",
+      "lib/tendermint-verifier/**",
       "./lib/poseidon-rs/constants.json"
     ]
   },
@@ -158,7 +209,9 @@
         "useFilenamingConvention": "off",
         "useConsistentArrayType": {
           "level": "warn",
-          "options": { "syntax": "generic" }
+          "options": {
+            "syntax": "generic"
+          }
         }
       },
       "a11y": {
@@ -168,32 +221,38 @@
       },
       "nursery": {
         "all": true,
-        "noConsole": "off",
-        "useTopLevelRegex": "off",
+        "noSecrets": "off",
+        "noProcessEnv": "off",
+        "useStrictMode": "off",
+        "noNestedTernary": "off",
         "noExportedImports": "off",
         "useImportRestrictions": "off",
-        "noUndeclaredDependencies": "off",
-        "noUnusedFunctionParameters": "off",
-        "noUselessUndefinedInitialization": "off"
+        "noDescendingSpecificity": "off",
+        "useExplicitFunctionReturnType": "off"
       },
       "performance": {
         "all": true,
         "noDelete": "off",
         "noBarrelFile": "off",
         "noReExportAll": "off",
+        "useTopLevelRegex": "off",
         "noAccumulatingSpread": "warn"
       },
       "correctness": {
         "all": true,
         "noNodejsModules": "off",
+        "noUnknownFunction": "off",
         "noUnusedVariables": "off",
-        "noUndeclaredVariables": "off"
+        "noUndeclaredVariables": "off",
+        "noUndeclaredDependencies": "off"
       },
       "suspicious": {
         "all": true,
+        "noConsole": "off",
         "noConsoleLog": "off",
         "noExplicitAny": "off",
         "noCatchAssign": "off",
+        "noArrayIndexKey": "off",
         "noEmptyInterface": "off",
         "noAssignInExpressions": "off"
       },
@@ -214,16 +273,23 @@
     "include": [
       "*.ts",
       "*.mts",
+      "*.cts",
       "*.js",
+      "*.mjs",
       "*.cjs",
       "*.jsx",
       "*.tsx",
       "*.d.ts",
+      "*.d.mts",
+      "*.d.cts",
       "*.vue",
+      "*.html",
+      "*.css",
       "*.json",
       "*.jsonc",
       "*.astro",
-      "*.svelte"
+      "*.svelte",
+      "*.graphql"
     ],
     "ignore": [
       "_",
@@ -233,13 +299,18 @@
       ".sqlx",
       "result",
       "vendor",
+      ".vercel",
       "testdata",
       "generated",
-      "*-env.d.ts",
       ".svelte-kit",
       "node_modules",
+      "light-clients/**",
       "package-lock.json",
+      "networks/genesis/**",
       "./app/src/generated",
+      "lib/scroll-verifier/**",
+      "lib/ethereum-verifier/**",
+      "lib/tendermint-verifier/**",
       "./lib/poseidon-rs/constants.json"
     ]
   },
@@ -270,7 +341,11 @@
   "overrides": [
     {
       "include": ["*.astro"],
+      "formatter": {
+        "enabled": true
+      },
       "linter": {
+        "enabled": true,
         "rules": {
           "correctness": {
             "noUnusedImports": "off",
@@ -284,12 +359,17 @@
     },
     {
       "include": ["*.svelte"],
+      "formatter": {
+        "enabled": true
+      },
       "linter": {
+        "enabled": true,
         "rules": {
           "correctness": {
             "noUnusedLabels": "off",
             "noUnusedImports": "off",
-            "useHookAtTopLevel": "off"
+            "useHookAtTopLevel": "off",
+            "noUnusedFunctionParameters": "off"
           },
           "style": {
             "useConst": "off",
@@ -298,7 +378,7 @@
           "suspicious": {
             "noConfusingLabels": "off"
           },
-          "nursery": {
+          "complexity": {
             "noUselessUndefinedInitialization": "off"
           }
         }
@@ -308,8 +388,16 @@
       "include": ["scripts", "*config*"],
       "linter": {
         "rules": {
-          "nursery": {
-            "noConsole": "off"
+          "nursery": {}
+        }
+      }
+    },
+    {
+      "include": ["*.jsx", "*.tsx"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noReactSpecificProps": "off"
           }
         }
       }

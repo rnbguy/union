@@ -1,8 +1,22 @@
-{ ... }: {
-  perSystem = { biome, pkgs, unstablePkgs, lib, ensureAtRepositoryRoot, ... }:
+_: {
+  perSystem =
+    {
+      biome,
+      pkgs,
+      unstablePkgs,
+      lib,
+      ensureAtRepositoryRoot,
+      ...
+    }:
     let
-      pkgsDeps = with pkgs; [ pkg-config biome ];
-      nodeDeps = with unstablePkgs; [ vips nodePackages_latest.nodejs ];
+      pkgsDeps = with pkgs; [
+        pkg-config
+        biome
+      ];
+      nodeDeps = with unstablePkgs; [
+        vips
+        nodePackages_latest.nodejs
+      ];
       combinedDeps = pkgsDeps ++ nodeDeps;
     in
     {
@@ -18,23 +32,21 @@
               echo "Applying nix fmt"
               nix fmt
 
-
-              echo "Applying biome fmt"
-              ${lib.getExe biome} format . \
-                --log-level="info" \
-                --log-kind="pretty" \
-                --error-on-warnings \
-                --diagnostic-level="info" \
-                --write
+              # seems deprecated
+              # echo "Applying biome fmt"
+              # ${lib.getExe biome} check . --write --unsafe \
+              #   --log-level="info" \
+              #   --log-kind="pretty" \
+              #   --diagnostic-level="info"
 
               echo "Checking spelling"
               nix build .\#checks.${pkgs.system}.spellcheck -L
 
-              echo "Running biome lint"
-              nix build .\#checks.${pkgs.system}.biome-lint -L
-
               echo "Running Site Check"
               nix run .\#site-check
+
+              echo "Running Docs Check"
+              nix run .\#docs-check
             '';
           };
         };

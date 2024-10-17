@@ -31,7 +31,6 @@ use crate::{
     Serialize,
     Deserialize,
 )]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[repr(transparent)]
 #[debug("U256({})", self)]
 pub struct U256(#[serde(with = "::serde_utils::u256_from_dec_str")] pub primitive_types::U256);
@@ -426,7 +425,7 @@ mod u256_tests {
             let string = format!(r#"{{"u256":"{hex}"}}"#);
             let t = serde_json::from_str::<T>(&string).unwrap();
 
-            dbg!(H256(t.u256.to_be_bytes()));
+            dbg!(<H256>::new(t.u256.to_be_bytes()));
 
             assert_eq!(t.u256.0.as_u64(), n);
 

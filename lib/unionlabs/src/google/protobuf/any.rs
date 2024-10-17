@@ -1,6 +1,7 @@
 use core::{fmt::Debug, marker::PhantomData};
 
 use frame_support_procedural::DebugNoBound;
+use macros::model;
 use prost::Message;
 use serde::{
     de::{self, Visitor},
@@ -15,7 +16,6 @@ use crate::{
 
 /// Wrapper type to indicate that a type is to be serialized as an Any.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Any<T>(pub T);
 
 /// Provides a way to convert a type `T` into an [`Any`], even if `T` is itself an [`Any`].
@@ -46,6 +46,32 @@ impl<T: TypeUrl + Encode<Proto>> IntoAny for Any<T> {
 
     fn into_any(self) -> Any<Self::T> {
         self
+    }
+}
+
+#[model]
+pub struct RawAny {
+    pub type_url: String,
+    #[serde(with = "::serde_utils::hex_string")]
+    #[debug(wrap = ::serde_utils::fmt::DebugAsHex)]
+    pub value: Vec<u8>,
+}
+
+impl From<protos::google::protobuf::Any> for RawAny {
+    fn from(value: protos::google::protobuf::Any) -> Self {
+        Self {
+            type_url: value.type_url,
+            value: value.value.to_vec(),
+        }
+    }
+}
+
+impl From<RawAny> for protos::google::protobuf::Any {
+    fn from(value: RawAny) -> Self {
+        Self {
+            type_url: value.type_url,
+            value: value.value.into(),
+        }
     }
 }
 
@@ -149,7 +175,7 @@ impl<T: Encode<Proto> + TypeUrl> Encode<Proto> for Any<T> {
 // }
 
 #[derive(DebugNoBound, thiserror::Error)]
-pub enum TryFromAnyError<T: Decode<Proto, Error: std::error::Error> + TypeUrl> {
+pub enum TryFromAnyError<T: Decode<Proto, Error: core::error::Error> + TypeUrl> {
     #[error(
         "incorrect type url, expected `{expected}` but found `{found}`",
         expected = T::type_url()
@@ -159,7 +185,7 @@ pub enum TryFromAnyError<T: Decode<Proto, Error: std::error::Error> + TypeUrl> {
     Decode(#[source] DecodeErrorOf<Proto, T>),
 }
 
-impl<T: Decode<Proto, Error: std::error::Error + PartialEq> + TypeUrl> PartialEq
+impl<T: Decode<Proto, Error: core::error::Error + PartialEq> + TypeUrl> PartialEq
     for TryFromAnyError<T>
 {
     fn eq(&self, other: &Self) -> bool {
@@ -174,7 +200,7 @@ impl<T: Decode<Proto, Error: std::error::Error + PartialEq> + TypeUrl> PartialEq
     }
 }
 
-impl<T: Decode<Proto, Error: std::error::Error + Clone> + TypeUrl> Clone for TryFromAnyError<T> {
+impl<T: Decode<Proto, Error: core::error::Error + Clone> + TypeUrl> Clone for TryFromAnyError<T> {
     fn clone(&self) -> Self {
         match self {
             TryFromAnyError::IncorrectTypeUrl { found } => TryFromAnyError::IncorrectTypeUrl {
@@ -187,7 +213,7 @@ impl<T: Decode<Proto, Error: std::error::Error + Clone> + TypeUrl> Clone for Try
 
 impl<T> TryFrom<protos::google::protobuf::Any> for Any<T>
 where
-    T: Decode<Proto, Error: std::error::Error> + TypeUrl,
+    T: Decode<Proto, Error: core::error::Error> + TypeUrl,
 {
     type Error = TryFromAnyError<T>;
 
@@ -206,7 +232,7 @@ where
 
 impl<T> Decode<Proto> for Any<T>
 where
-    T: Decode<Proto, Error: std::error::Error> + TypeUrl,
+    T: Decode<Proto, Error: core::error::Error> + TypeUrl,
 {
     type Error = TryFromProtoBytesError<TryFromAnyError<T>>;
 

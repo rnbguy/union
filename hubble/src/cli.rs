@@ -45,6 +45,10 @@ pub struct Args {
         default_value = "json"
     )]
     pub log_format: LogFormat,
+
+    /// List of URLs to include.
+    #[arg(short, long, env = "TOKENS_URLS")]
+    pub tokens_urls: TokensUrls,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -64,12 +68,6 @@ impl IntoIterator for Indexers {
 #[serde(tag = "type")]
 #[allow(clippy::large_enum_variant)]
 pub enum IndexerConfig {
-    #[serde(rename = "tendermint")]
-    Tm(crate::tm::Config),
-    #[serde(rename = "ethereum")]
-    Eth(crate::eth::Config),
-    #[serde(rename = "ethereum-fork")]
-    EthFork(crate::eth::fork::Config),
     #[serde(rename = "beacon")]
     Beacon(crate::beacon::Config),
     #[serde(rename = "bera")]
@@ -78,18 +76,27 @@ pub enum IndexerConfig {
     Arb(crate::arb::Config),
     #[serde(rename = "scroll")]
     Scroll(crate::scroll::Config),
+    #[serde(rename = "dummy-fetcher")]
+    DummyFetcher(crate::indexer::dummy::config::Config),
+    #[serde(rename = "eth-fetcher")]
+    EthFetcher(crate::indexer::eth::config::Config),
+    #[serde(rename = "tm-fetcher")]
+    TmFetcher(crate::indexer::tm::config::Config),
+    #[serde(rename = "aptos-fetcher")]
+    AptosFetcher(crate::indexer::aptos::config::Config),
 }
 
 impl IndexerConfig {
     pub fn label(&self) -> &str {
         match &self {
-            Self::Tm(cfg) => &cfg.label,
-            Self::Eth(cfg) => &cfg.label,
             Self::Beacon(cfg) => &cfg.label,
             Self::Bera(cfg) => &cfg.label,
-            Self::EthFork(cfg) => &cfg.label,
             Self::Arb(cfg) => &cfg.label,
             Self::Scroll(cfg) => &cfg.label,
+            Self::DummyFetcher(cfg) => &cfg.indexer_id,
+            Self::EthFetcher(cfg) => &cfg.indexer_id,
+            Self::TmFetcher(cfg) => &cfg.indexer_id,
+            Self::AptosFetcher(cfg) => &cfg.indexer_id,
         }
     }
 }
@@ -102,15 +109,6 @@ impl IndexerConfig {
         let indexer_span = info_span!("indexer", label);
 
         match self {
-            Self::Tm(cfg) => cfg.index(db).instrument(indexer_span).await,
-            Self::Eth(cfg) => {
-                cfg.indexer(db)
-                    .instrument(initializer_span)
-                    .await?
-                    .index()
-                    .instrument(indexer_span)
-                    .await
-            }
             Self::Beacon(cfg) => {
                 cfg.indexer(db)
                     .instrument(initializer_span)
@@ -120,14 +118,6 @@ impl IndexerConfig {
                     .await
             }
             Self::Bera(cfg) => {
-                cfg.indexer(db)
-                    .instrument(initializer_span)
-                    .await?
-                    .index()
-                    .instrument(indexer_span)
-                    .await
-            }
-            Self::EthFork(cfg) => {
                 cfg.indexer(db)
                     .instrument(initializer_span)
                     .await?
@@ -151,11 +141,64 @@ impl IndexerConfig {
                     .instrument(indexer_span)
                     .await
             }
+            Self::DummyFetcher(cfg) => {
+                cfg.build(db)
+                    .instrument(initializer_span)
+                    .await?
+                    .index()
+                    .instrument(indexer_span)
+                    .await
+            }
+            Self::EthFetcher(cfg) => {
+                cfg.build(db)
+                    .instrument(initializer_span)
+                    .await?
+                    .index()
+                    .instrument(indexer_span)
+                    .await
+            }
+            Self::TmFetcher(cfg) => {
+                cfg.build(db)
+                    .instrument(initializer_span)
+                    .await?
+                    .index()
+                    .instrument(indexer_span)
+                    .await
+            }
+            Self::AptosFetcher(cfg) => {
+                cfg.build(db)
+                    .instrument(initializer_span)
+                    .await?
+                    .index()
+                    .instrument(indexer_span)
+                    .await
+            }
         }
     }
 }
 
 impl FromStr for Indexers {
+    type Err = color_eyre::eyre::Error;
+
+    fn from_str(item: &str) -> Result<Self, <Self as FromStr>::Err> {
+        serde_json::from_str(item).map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct TokensUrls(Vec<String>);
+
+impl IntoIterator for TokensUrls {
+    type Item = String;
+
+    type IntoIter = std::vec::IntoIter<String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl FromStr for TokensUrls {
     type Err = color_eyre::eyre::Error;
 
     fn from_str(item: &str) -> Result<Self, <Self as FromStr>::Err> {

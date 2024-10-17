@@ -1,57 +1,110 @@
 import { ofetch } from "ofetch"
 import { ucs01RelayAbi } from "../../abi/ucs-01.ts"
+import type { ChainId } from "../../client/types.ts"
 import { bech32AddressToHex } from "../../convert.ts"
 import { encodeFunctionData, getAddress, type Address } from "viem"
 
-const TENDERLY_URL =
-  process.env?.TENDERLY_URL ?? "https://api.tenderly.co/api/v1/account/amor-fati/project/project"
+/**
+ * get tenderly credentials
+ * @example
+ * ```ts
+ * const { url, key } = getTenderlyCreds({
+ *   account: "my-tenderly-account",
+ *   project: "my-tenderly-project",
+ * })
+ * ```
+ * @note WIP
+ */
+function getTenderlyCreds(slug: {
+  account: string
+  project: string
+}): {
+  url: string
+  key: string
+} {
+  let url = "https://api.tenderly.co/api/v1/account"
+  if (process["env"] === undefined || process["env"]?.["TENDERLY_URL"] === undefined) {
+    return {
+      key: "",
+      url: `${url}/${slug.account}/project/${slug.project}`
+    }
+  }
+  return {
+    url: process["env"]?.["TENDERLY_URL"],
+    key: ""
+  }
+}
 
-const queryHeaders = new Headers({
-  Accept: "application/json",
-  "User-Agent": "typescript-sdk",
-  "Content-Type": "application/json",
-  "X-Access-Key": "QuVUQN413ao7WmlTQR82YTTiNSCYRRSi"
-})
-
-const tenderlyRequest = ofetch.create({
-  retry: 2,
-  retryDelay: 500,
-  timeout: 6_000,
-  headers: queryHeaders,
-  baseURL: TENDERLY_URL
-})
-
+/**
+ * simulate a transaction on evm using Tenderly API
+ * @example
+ * ```ts
+ * const gas = await simulateTransaction({
+ *   memo: "test",
+ *   amount: 1n,
+ *   account: evmAccount,
+ *   sourceChannel: "channel-1",
+ *   receiver: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *   denomAddress: "0x779877A7B0D9E8603169DdbD7836e478b4624789",
+ *   relayContractAddress: "0x2222222222222222222222222222222222222222",
+ * })
+ * ```
+ */
 export async function simulateTransaction({
   memo,
   amount,
   account,
-  recipient,
+  receiver,
   denomAddress,
   sourceChannel,
   relayContractAddress
 }: {
   memo?: string
   amount: bigint
-  recipient: string
+  receiver: string
   account?: Address
   denomAddress: Address
   sourceChannel: string
+  sourceChainId?: ChainId
+  destinationChainId?: ChainId
   relayContractAddress: Address
 }) {
+  let { url: TENDERLY_URL, key: TENDERLY_KEY } = getTenderlyCreds({
+    project: "project",
+    account: "amor-fati"
+  })
+
+  // @note throwaway key
+  TENDERLY_KEY ||= "zQs9t0eoXQybyVbGfV4dSihLElP0Uyl1"
+
+  const queryHeaders = new Headers({
+    Accept: "application/json",
+    "User-Agent": "typescript-sdk",
+    "Content-Type": "application/json",
+    "X-Access-Key": TENDERLY_KEY
+  })
+
+  const tenderlyRequest = ofetch.create({
+    retry: 2,
+    retryDelay: 500,
+    timeout: 6_000,
+    headers: queryHeaders,
+    baseURL: TENDERLY_URL
+  })
+
   const encodedFunctionData = encodeFunctionData({
     abi: ucs01RelayAbi,
     functionName: "send",
     args: [
       sourceChannel,
-      recipient.startsWith("0x")
-        ? getAddress(recipient)
-        : bech32AddressToHex({ address: recipient }),
+      receiver.startsWith("0x") ? getAddress(receiver) : bech32AddressToHex({ address: receiver }),
       [{ denom: denomAddress, amount }],
       memo ?? "",
       { revision_number: 9n, revision_height: BigInt(999_999_999) + 100n },
       0n
     ]
   })
+
   const data = await tenderlyRequest<TenderlySimulationResponse>("/simulate", {
     method: "POST",
     body: JSON.stringify({

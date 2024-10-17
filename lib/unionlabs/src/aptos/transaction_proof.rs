@@ -1,11 +1,13 @@
 use macros::model;
-use serde::{Deserialize, Serialize};
 
-use super::{
-    hash_value::HashValue,
-    transaction_info::{TransactionInfo, TryFromTransactionInfoError},
+use crate::{
+    aptos::transaction_info::{TransactionInfo, TryFromTransactionInfoError},
+    errors::{required, InvalidLength, MissingField},
+    hash::{
+        hash_v2::{Hash, HexUnprefixed},
+        H256,
+    },
 };
-use crate::errors::{required, InvalidLength, MissingField};
 
 /// `TransactionInfo` and a `TransactionAccumulatorProof` connecting it to the ledger root.
 #[model(proto(
@@ -22,10 +24,36 @@ pub struct TransactionInfoWithProof {
     pub transaction_info: TransactionInfo,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TransactionAccumulatorProof {
-    pub siblings: Vec<HashValue>,
+// TODO(aeryz): only for testing purposes until we have proper proofs
+impl Default for TransactionInfoWithProof {
+    fn default() -> Self {
+        Self {
+            ledger_info_to_transaction_info_proof: TransactionAccumulatorProof {
+                siblings: vec![],
+                phantom: Null,
+            },
+            transaction_info: TransactionInfo::V0(super::transaction_info::TransactionInfoV0 {
+                gas_used: 0,
+                status: super::transaction_info::ExecutionStatus::Success,
+                transaction_hash: Hash::default(),
+                event_root_hash: Hash::default(),
+                state_change_hash: Hash::default(),
+                state_checkpoint_hash: Some(Hash::default()),
+                state_cemetery_hash: None,
+            }),
+        }
+    }
 }
+
+#[model]
+pub struct TransactionAccumulatorProof {
+    pub siblings: Vec<H256<HexUnprefixed>>,
+    pub phantom: Null,
+}
+
+// idk man, it's in the json
+#[model]
+pub struct Null;
 
 impl From<TransactionInfoWithProof>
     for protos::union::ibc::lightclients::movement::v1::TransactionInfoWithProof
@@ -68,6 +96,7 @@ impl TryFrom<protos::union::ibc::lightclients::movement::v1::TransactionInfoWith
                     .into_iter()
                     .map(TryInto::try_into)
                     .collect::<Result<Vec<_>, _>>()?,
+                phantom: Null,
             },
             transaction_info: required!(value.transaction_info)?.try_into()?,
         })

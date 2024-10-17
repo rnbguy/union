@@ -4,17 +4,17 @@ Relaying is hard. There are several key properties to a reliable relayer, the mo
 which being:
 
 - **Speed.** IBC Relaying is a race to the bottom, with many relayers fighting to be the first to
-submit a packet, often times submitting a packet that ends up being frontrun.
+  submit a packet, often times submitting a packet that ends up being frontrun.
 - **Data Integrity.** There's no use being the first to submit a packet if the packet is submitted
-incorrectly, and a good relayer will never drop packets. The latter is especially important for
-ordered channels, as a channel will be closed if a packet on it times out.
+  incorrectly, and a good relayer will never drop packets. The latter is especially important for
+  ordered channels, as a channel will be closed if a packet on it times out.
 - **Quick Startup Times.** RPCs are unreliable, and it's incredibly difficult to build around every
-possible failure case - especially when connecting to multiple different chains. Even with proper
-error handling and retry logic, in the event of a crash, startup time should be miniscule (see:
-<https://github.com/clemensgg/xion-relayer-postmortem>)
+  possible failure case - especially when connecting to multiple different chains. Even with proper
+  error handling and retry logic, in the event of a crash, startup time should be miniscule (see:
+  <https://github.com/clemensgg/xion-relayer-postmortem>)
 
 Voyager takes a novel approach to solving these problems. Internally, everything is modeled as a
-finite state machine, which is stored in postgres to ensure transactional integrity. Every chain
+finite state machine, ([`voyager-vm`](/lib/voyager-vm/README.md)), which is stored in postgres to ensure transactional integrity ([`pg-queue`](/lib/pg-queue/README.md)). Every chain
 query, transaction submission, and even the data itself is represented as a state within the queue.
 This design solves two of the properties mentioned above out of the box: **Data Integrity** and
 **Quick Startup Times**. Since no state is stored in Voyager itself, it is able to crash and restart
@@ -25,6 +25,8 @@ by this design - since each message fully encapsulates all the state it needs to
 messages can safely be executed in parallel. This means, for instance, that while one worker is
 fetching events from a block, another could be submitting a light client update, and another could
 be generating a state proof, and so on.
+
+For more information on voyager's architecture, see [CONCEPTS.md](/voyager/CONCEPTS.md)
 
 ## Light Clients
 

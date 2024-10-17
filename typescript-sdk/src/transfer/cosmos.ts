@@ -6,290 +6,464 @@ import {
 } from "@cosmjs/stargate"
 import type {
   Coin,
-  TransactionResponse,
   MessageTransferWithOptionals,
   OfflineSigner as CosmosOfflineSigner
 } from "../types.ts"
 import { timestamp } from "../utilities/index.ts"
+import { ok, err, type Result, ResultAsync } from "neverthrow"
 import { SigningCosmWasmClient, type ExecuteInstruction } from "@cosmjs/cosmwasm-stargate"
 
 /**
- * TODO:
- * - [ ] prefix logs with context to make it easier to debug
+ * connect a stargate client with a signer
+ * @example
+ * ```ts
+ * const client = await connectStargateWithSigner({
+ *   account: cosmosAccount,
+ *   rpcUrl: "https://rpc.testnet-8.union.build",
+ *   gasPrice: { amount: "0.0025", denom: "muno" },
+ * })
+ *
+ * if (client.isOk()) {
+ *   const tx = await client.value.getTx("A6E276CE66CDB35C0CAAC49EC9AAB3CB2CF8A34C807A4C729EA385E64C88D69B")
+ * }
+ * ```
  */
+export function connectStargateWithSigner({
+  rpcUrl,
+  account,
+  gasPrice
+}: {
+  rpcUrl: string
+  account: CosmosOfflineSigner
+  gasPrice: { amount: string; denom: string }
+}): ResultAsync<SigningStargateClient, Error> {
+  return ResultAsync.fromPromise(
+    SigningStargateClient.connectWithSigner(rpcUrl, account, {
+      gasPrice: GasPrice.fromString(`${gasPrice.amount}${gasPrice.denom}`)
+    }),
+    error => {
+      console.error("@unionlabs/client-[connectStargateWithSigner]", error)
+      return new Error("Failed to connect with stargate signer", { cause: error })
+    }
+  )
+}
+
+/**
+ * connect a stargate client with a signer
+ * @example
+ * ```ts
+ * const client = await connectCosmwasmWithSigner({
+ *   account: cosmosAccount,
+ *   rpcUrl: "https://rpc.testnet-8.union.build",
+ *   gasPrice: { amount: "0.0025", denom: "muno" },
+ * })
+ *
+ * if (client.isOk()) {
+ *   const tx = await client.value.getTx("A6E276CE66CDB35C0CAAC49EC9AAB3CB2CF8A34C807A4C729EA385E64C88D69B")
+ * }
+ * ```
+ */
+export function connectCosmwasmWithSigner({
+  rpcUrl,
+  account,
+  gasPrice
+}: {
+  rpcUrl: string
+  account: CosmosOfflineSigner
+  gasPrice: { amount: string; denom: string }
+}): ResultAsync<SigningCosmWasmClient, Error> {
+  return ResultAsync.fromPromise(
+    SigningCosmWasmClient.connectWithSigner(rpcUrl, account, {
+      gasPrice: GasPrice.fromString(`${gasPrice.amount}${gasPrice.denom}`)
+    }),
+    error => {
+      console.error("@unionlabs/client-[connectCosmwasmWithSigner]", error)
+      return new Error("Failed to connect with cosmwasm signer", { cause: error })
+    }
+  )
+}
 
 /**
  * Make ICS-20 transfer:
  * - https://github.com/cosmos/ibc/blob/main/spec/app/ics-020-fungible-token-transfer/README.md
  * - transfer tokens from ibc-enabled chain to another ibc-enabled chain
+ *
+ * @example
+ * ```ts
+ * const transfer = await ibcTransfer(client, {
+ *   gasPrice: { amount: "0.0025", denom: "muno" },
+ *   account: cosmosAccount,
+ *   rpcUrl: "https://rpc.testnet-8.union.build",
+ *   messageTransfers: [
+ *     {
+ *       sourcePort: "transfer",
+ *       sourceChannel: "channel-1",
+ *       sender: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *       token: { denom: "muno", amount: "1" },
+ *       timeoutHeight: { revisionHeight: 888n, revisionNumber: 8n },
+ *       receiver: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *       memo: "test",
+ *     },
+ *   ],
+ * })
+ * ```
  */
 export async function ibcTransfer({
   gasPrice,
-  cosmosSigner,
-  cosmosRpcUrl,
+  account,
+  rpcUrl,
   messageTransfers
 }: {
   gasPrice: { amount: string; denom: string }
-  cosmosRpcUrl: string
-  cosmosSigner: CosmosOfflineSigner
+  rpcUrl: string
+  account: CosmosOfflineSigner
   messageTransfers: Array<MessageTransferWithOptionals>
-}): Promise<TransactionResponse> {
-  try {
-    const [account] = await cosmosSigner.getAccounts()
-    if (!account) return { success: false, data: "No account found" }
+}): Promise<Result<string, Error>> {
+  const accountResult = await ResultAsync.fromPromise(account.getAccounts(), error => {
+    console.error("@unionlabs/client-[ibcTransfer]_accountResult", error)
+    return new Error("Failed to get accounts", { cause: error })
+  }).andThen(([_account]) => {
+    if (_account) return ok(_account)
+    console.error("@unionlabs/client-[ibcTransfer]_accountResult", accountResult)
+    return err(new Error("No account found"))
+  })
 
-    const signingClient = await SigningStargateClient.connectWithSigner(
-      cosmosRpcUrl,
-      cosmosSigner,
-      { gasPrice: GasPrice.fromString(`${gasPrice.amount}${gasPrice.denom}`) }
-    )
+  if (accountResult.isErr()) return err(accountResult.error)
+  const _account = accountResult.value
 
-    const response = await signingClient.signAndBroadcast(
-      account.address,
-      messageTransfers.map(
-        ({ sender = account.address, timeoutTimestamp = 0n, ...messageTransfer }) => ({
-          typeUrl: "/ibc.applications.transfer.v1.MsgTransfer",
-          value: { sender, timeoutTimestamp, ...messageTransfer }
-        })
-      ) satisfies Array<MsgTransferEncodeObject>,
-      "auto"
-    )
+  const signingClient = await connectStargateWithSigner({
+    rpcUrl,
+    account,
+    gasPrice
+  })
 
-    assertIsDeliverTxSuccess(response)
+  if (signingClient.isErr()) return err(signingClient.error)
+  const _signingClient = signingClient.value
 
-    signingClient.disconnect()
-    return { success: true, data: response.transactionHash }
-  } catch (error) {
-    return {
-      success: false,
-      data: error instanceof Error ? error.message : "An unknown error occurred"
-    }
-  }
-}
+  const response = await _signingClient.signAndBroadcast(
+    _account.address,
+    messageTransfers.map(
+      ({ sender = _account.address, timeoutTimestamp = 0n, ...messageTransfer }) => ({
+        typeUrl: "/ibc.applications.transfer.v1.MsgTransfer",
+        value: { sender, timeoutTimestamp, ...messageTransfer }
+      })
+    ) satisfies Array<MsgTransferEncodeObject>,
+    "auto"
+  )
 
-export async function ibcTransferSimulate({
-  gasPrice,
-  cosmosSigner,
-  cosmosRpcUrl,
-  messageTransfers
-}: {
-  gasPrice: { amount: string; denom: string }
-  cosmosRpcUrl: string
-  cosmosSigner: CosmosOfflineSigner
-  messageTransfers: Array<MessageTransferWithOptionals>
-}): Promise<TransactionResponse> {
-  try {
-    const signingClient = await SigningStargateClient.connectWithSigner(
-      cosmosRpcUrl,
-      cosmosSigner,
-      { gasPrice: GasPrice.fromString(`${gasPrice.amount}${gasPrice.denom}`) }
-    )
-
-    const [account] = await cosmosSigner.getAccounts()
-    if (!account) return { success: false, data: "No account found" }
-
-    const gas = await signingClient.simulate(
-      account.address,
-      messageTransfers.map(
-        ({ sender = account.address, timeoutTimestamp = 0n, ...messageTransfer }) => ({
-          typeUrl: "/ibc.applications.transfer.v1.MsgTransfer",
-          value: { sender, timeoutTimestamp, ...messageTransfer }
-        })
-      ) satisfies Array<MsgTransferEncodeObject>,
-      "auto"
-    )
-
-    signingClient.disconnect()
-    return { success: true, data: gas.toString() }
-  } catch (error) {
-    return {
-      success: false,
-      data: error instanceof Error ? error.message : "An unknown error occurred"
-    }
-  }
+  _signingClient.disconnect()
+  return ok(response.transactionHash)
 }
 
 /**
- * Transfer tokens where the source is Union
+ * simulate an ibc transfer
+ * @example
+ * ```ts
+ * const transfer = await ibcTransferSimulate(client, {
+ *   gasPrice: { amount: "0.0025", denom: "muno" },
+ *   account: cosmosAccount,
+ *   rpcUrl: "https://rpc.testnet-8.union.build",
+ *   messageTransfers: [
+ *     {
+ *       sourcePort: "transfer",
+ *       sourceChannel: "channel-1",
+ *       sender: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *       token: { denom: "muno", amount: "1" },
+ *       timeoutHeight: { revisionHeight: 888n, revisionNumber: 8n },
+ *       receiver: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *       memo: "test",
+ *     },
+ *   ],
+ * })
+ * ```
+ */
+export async function ibcTransferSimulate({
+  gasPrice,
+  account,
+  rpcUrl,
+  messageTransfers
+}: {
+  gasPrice: { amount: string; denom: string }
+  rpcUrl: string
+  account: CosmosOfflineSigner
+  messageTransfers: Array<MessageTransferWithOptionals>
+}): Promise<Result<string, Error>> {
+  const accountResult = await ResultAsync.fromPromise(account.getAccounts(), error => {
+    console.error("@unionlabs/client-[ibcTransferSimulate]_accountResult", error)
+    return new Error("Failed to get accounts", { cause: error })
+  }).andThen(([_account]) => (_account ? ok(_account) : err(new Error("No account found"))))
+
+  if (accountResult.isErr()) return err(accountResult.error)
+  const _account = accountResult.value
+
+  const signingClient = await connectStargateWithSigner({
+    rpcUrl,
+    account,
+    gasPrice
+  })
+  if (signingClient.isErr()) return err(signingClient.error)
+  const _signingClient = signingClient.value
+
+  const gas = await _signingClient.simulate(
+    _account.address,
+    messageTransfers.map(
+      ({ sender = _account.address, timeoutTimestamp = 0n, ...messageTransfer }) => ({
+        typeUrl: "/ibc.applications.transfer.v1.MsgTransfer",
+        value: { sender, timeoutTimestamp, ...messageTransfer }
+      })
+    ) satisfies Array<MsgTransferEncodeObject>,
+    "auto"
+  )
+
+  _signingClient.disconnect()
+  return ok(gas.toString())
+}
+
+/**
+ * transfer a wasm contract
+ * @example
+ * ```ts
+ * const transfer = await cosmwasmTransfer(client, {
+ *   gasPrice: { amount: "0.0025", denom: "muno" },
+ *   account: cosmosAccount,
+ *   rpcUrl: "https://rpc.testnet-8.union.build",
+ *   instructions: [
+ *     {
+ *       contractAddress: "0x2222222222222222222222222222222222222222",
+ *       msg: {
+ *         transfer: {
+ *           channel: "channel-1",
+ *           receiver: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *           memo: "test",
+ *         },
+ *       },
+ *       funds: [{ denom: "muno", amount: "1" }],
+ *     },
+ *   ],
+ * })
+ * ```
  */
 export async function cosmwasmTransfer({
   gasPrice,
   instructions,
-  cosmosSigner,
-  cosmosRpcUrl
+  account,
+  rpcUrl
 }: {
-  cosmosRpcUrl: string
-  cosmosSigner: CosmosOfflineSigner
+  rpcUrl: string
+  account: CosmosOfflineSigner
   instructions: Array<ExecuteInstruction>
   gasPrice: { amount: string; denom: string }
-}): Promise<TransactionResponse> {
-  try {
-    const [account] = await cosmosSigner.getAccounts()
-    if (!account) return { success: false, data: "No account found" }
+}): Promise<Result<string, Error>> {
+  const accountResult = await ResultAsync.fromPromise(account.getAccounts(), error => {
+    console.error("@unionlabs/client-[cosmwasmTransfer]_accountResult", error)
+    return new Error("Failed to get accounts", { cause: error })
+  }).andThen(([_account]) => (_account ? ok(_account) : err(new Error("No account found"))))
 
-    const signingClient = await SigningCosmWasmClient.connectWithSigner(
-      cosmosRpcUrl,
-      cosmosSigner,
-      { gasPrice: GasPrice.fromString(`${gasPrice.amount}${gasPrice.denom}`) }
-    )
-    const response = await signingClient.executeMultiple(account.address, instructions, "auto")
+  if (accountResult.isErr()) return err(accountResult.error)
+  const _account = accountResult.value
 
-    signingClient.disconnect()
-    return { success: true, data: response.transactionHash }
-  } catch (error) {
-    return {
-      success: false,
-      data: error instanceof Error ? error.message : "An unknown error occurred"
-    }
-  }
-}
+  const signingClient = await connectCosmwasmWithSigner({
+    rpcUrl,
+    account,
+    gasPrice
+  })
+  if (signingClient.isErr()) return err(signingClient.error)
+  const _signingClient = signingClient.value
 
-export async function cosmwasmTransferSimulate({
-  gasPrice,
-  instructions,
-  cosmosSigner,
-  cosmosRpcUrl
-}: {
-  cosmosRpcUrl: string
-  cosmosSigner: CosmosOfflineSigner
-  instructions: Array<ExecuteInstruction>
-  gasPrice: { amount: string; denom: string }
-}): Promise<TransactionResponse> {
-  try {
-    const signingClient = await SigningCosmWasmClient.connectWithSigner(
-      cosmosRpcUrl,
-      cosmosSigner,
-      { gasPrice: GasPrice.fromString(`${gasPrice.amount}${gasPrice.denom}`) }
-    )
+  const response = await _signingClient.executeMultiple(_account.address, instructions, "auto")
 
-    const [account] = await cosmosSigner.getAccounts()
-    if (!account) return { success: false, data: "No account found" }
-
-    const gas = await signingClient.simulate(
-      account.address,
-      instructions.map(instruction => ({
-        typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
-        value: {
-          sender: account.address,
-          contract: instruction.contractAddress,
-          msg: new TextEncoder().encode(JSON.stringify(instruction.msg)),
-          funds: instruction.funds?.map(fund => ({
-            denom: fund.denom,
-            amount: fund.amount.toString()
-          }))
-        }
-      })),
-      "auto"
-    )
-
-    signingClient.disconnect()
-    return { success: true, data: gas.toString() }
-  } catch (error) {
-    return {
-      success: false,
-      data: error instanceof Error ? error.message : "An unknown error occurred"
-    }
-  }
+  _signingClient.disconnect()
+  return ok(response.transactionHash)
 }
 
 /**
- * Transfer tokens where where source and destination are the same chain
+ * simulate a wasm contract
+ * @example
+ * ```ts
+ * const transfer = await cosmwasmTransferSimulate(client, {
+ *   gasPrice: { amount: "0.0025", denom: "muno" },
+ *   account: cosmosAccount,
+ *   rpcUrl: "https://rpc.testnet-8.union.build",
+ *   instructions: [
+ *     {
+ *       contractAddress: "0x2222222222222222222222222222222222222222",
+ *       msg: {
+ *         transfer: {
+ *           channel: "channel-1",
+ *           receiver: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *           memo: "test",
+ *         },
+ *       },
+ *       funds: [{ denom: "muno", amount: "1" }],
+ *     },
+ *   ],
+ * })
+ * ```
+ */
+export async function cosmwasmTransferSimulate({
+  gasPrice,
+  instructions,
+  account,
+  rpcUrl
+}: {
+  rpcUrl: string
+  account: CosmosOfflineSigner
+  instructions: Array<ExecuteInstruction>
+  gasPrice: { amount: string; denom: string }
+}): Promise<Result<string, Error>> {
+  const accountResult = await ResultAsync.fromPromise(
+    account.getAccounts(),
+    error => new Error("Failed to get accounts", { cause: error })
+  ).andThen(([_account]) => (_account ? ok(_account) : err(new Error("No account found"))))
+
+  if (accountResult.isErr()) return err(accountResult.error)
+  const _account = accountResult.value
+
+  const signingClient = await connectCosmwasmWithSigner({
+    rpcUrl,
+    account,
+    gasPrice
+  })
+  if (signingClient.isErr()) return err(signingClient.error)
+  const _signingClient = signingClient.value
+
+  const response = await _signingClient.simulate(
+    _account.address,
+    instructions.map(instruction => ({
+      typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
+      value: {
+        sender: _account.address,
+        contract: instruction.contractAddress,
+        msg: new TextEncoder().encode(JSON.stringify(instruction.msg)),
+        funds: instruction.funds
+      }
+    })),
+    "auto"
+  )
+
+  _signingClient.disconnect()
+  return ok(response.toString())
+}
+
+/**
+ * transfer an asset from cosmos
+ * @example
+ * ```ts
+ * const transfer = await cosmosSameChainTransfer(client, {
+ *   asset: { denom: "muno", amount: "1" },
+ *   gasPrice: { amount: "0.0025", denom: "muno" },
+ *   receiver: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *   account: cosmosAccount,
+ *   rpcUrl: "https://rpc.testnet-8.union.build",
+ * })
+ * ```
  */
 export async function cosmosSameChainTransfer({
   asset,
   gasPrice,
-  recipient,
-  cosmosSigner,
-  cosmosRpcUrl
+  receiver,
+  account,
+  rpcUrl
 }: {
   asset: Coin
-  recipient: string
-  cosmosRpcUrl: string
-  cosmosSigner: CosmosOfflineSigner
+  rpcUrl: string
+  receiver: string
+  account: CosmosOfflineSigner
   gasPrice: { amount: string; denom: string }
-}): Promise<TransactionResponse> {
-  try {
-    const [account] = await cosmosSigner.getAccounts()
-    if (!account) return { success: false, data: "No account found" }
+}): Promise<Result<string, Error>> {
+  const accountResult = await ResultAsync.fromPromise(
+    account.getAccounts(),
+    () => new Error("Failed to get accounts")
+  ).andThen(([_account]) => (_account ? ok(_account) : err(new Error("No account found"))))
 
-    const signingClient = await SigningStargateClient.connectWithSigner(
-      cosmosRpcUrl,
-      cosmosSigner,
-      { gasPrice: GasPrice.fromString(`${gasPrice.amount}${gasPrice.denom}`) }
-    )
+  if (accountResult.isErr()) return err(accountResult.error)
+  const _account = accountResult.value
 
-    const response = await signingClient.signAndBroadcast(
-      account.address,
-      [
-        {
-          typeUrl: "/cosmos.bank.v1beta1.MsgSend",
-          value: {
-            fromAddress: account.address,
-            toAddress: recipient,
-            amount: [asset]
-          }
+  const signingClient = await connectStargateWithSigner({
+    rpcUrl,
+    account,
+    gasPrice
+  })
+  if (signingClient.isErr()) return err(signingClient.error)
+  const _signingClient = signingClient.value
+
+  const response = await _signingClient.signAndBroadcast(
+    _account.address,
+    [
+      {
+        typeUrl: "/cosmos.bank.v1beta1.MsgSend",
+        value: {
+          fromAddress: _account.address,
+          toAddress: receiver,
+          amount: [asset]
         }
-      ],
-      "auto",
-      `${timestamp()} Sending ${asset.amount} ${asset.denom} to ${recipient}`
-    )
-
-    assertIsDeliverTxSuccess(response)
-
-    signingClient.disconnect()
-    return { success: true, data: response.transactionHash }
-  } catch (error) {
-    return {
-      success: false,
-      data: error instanceof Error ? error.message : "An unknown error occurred"
-    }
-  }
+      }
+    ],
+    "auto",
+    `${timestamp()} Sending ${asset.amount} ${asset.denom} to ${receiver}`
+  )
+  assertIsDeliverTxSuccess(response)
+  _signingClient.disconnect()
+  return ok(response.transactionHash)
 }
 
+/**
+ * simulate a transfer asset from cosmos
+ * @example
+ * ```ts
+ * const transfer = await cosmosSameChainTransferSimulate(client, {
+ *   asset: { denom: "muno", amount: "1" },
+ *   gasPrice: { amount: "0.0025", denom: "muno" },
+ *   receiver: "0x8478B37E983F520dBCB5d7D3aAD8276B82631aBd",
+ *   account: cosmosAccount,
+ *   rpcUrl: "https://rpc.testnet-8.union.build",
+ * })
+ * ```
+ */
 export async function cosmosSameChainTransferSimulate({
   asset,
   gasPrice,
-  recipient,
-  cosmosSigner,
-  cosmosRpcUrl
+  receiver,
+  account,
+  rpcUrl
 }: {
   asset: Coin
-  recipient: string
-  cosmosRpcUrl: string
-  cosmosSigner: CosmosOfflineSigner
+  receiver: string
+  rpcUrl: string
+  account: CosmosOfflineSigner
   gasPrice: { amount: string; denom: string }
-}): Promise<TransactionResponse> {
-  try {
-    const signingClient = await SigningStargateClient.connectWithSigner(
-      cosmosRpcUrl,
-      cosmosSigner,
-      { gasPrice: GasPrice.fromString(`${gasPrice.amount}${gasPrice.denom}`) }
-    )
+}): Promise<Result<string, Error>> {
+  const accountResult = await ResultAsync.fromPromise(
+    account.getAccounts(),
+    () => new Error("Failed to get accounts")
+  ).andThen(([_account]) => (_account ? ok(_account) : err(new Error("No account found"))))
 
-    const [account] = await cosmosSigner.getAccounts()
-    if (!account) return { success: false, data: "No account found" }
+  if (accountResult.isErr()) return err(accountResult.error)
+  const _account = accountResult.value
 
-    const gas = await signingClient.simulate(
-      account.address,
-      [
-        {
-          typeUrl: "/cosmos.bank.v1beta1.MsgSend",
-          value: {
-            amount: [asset],
-            toAddress: recipient,
-            fromAddress: account.address
-          }
+  const signingClient = await connectStargateWithSigner({
+    rpcUrl,
+    account,
+    gasPrice
+  })
+  if (signingClient.isErr()) return err(signingClient.error)
+  const _signingClient = signingClient.value
+
+  const response = await _signingClient.simulate(
+    _account.address,
+    [
+      {
+        typeUrl: "/cosmos.bank.v1beta1.MsgSend",
+        value: {
+          amount: [asset],
+          toAddress: receiver,
+          fromAddress: _account.address
         }
-      ],
-      "auto"
-    )
+      }
+    ],
+    "auto"
+  )
 
-    signingClient.disconnect()
-    return { success: true, data: gas.toString() }
-  } catch (error) {
-    return {
-      success: false,
-      data: error instanceof Error ? error.message : "An unknown error occurred"
-    }
-  }
+  _signingClient.disconnect()
+  return ok(response.toString())
 }

@@ -1,17 +1,17 @@
-import { derived, get, type Readable } from "svelte/store"
+import type { Address } from "viem"
 import { sleep } from "$lib/utilities/index.ts"
 import { persisted } from "svelte-persisted-store"
-import type { ChainWalletStore } from "$lib/wallet/types"
-import { unionKeplrChainInfo, unionLeapChainInfo } from "$lib/wallet/cosmos/chain-info.ts"
 import type { UserAddressCosmos } from "$lib/types"
-import { rawToHex } from "$lib/utilities/address"
-import type { Address } from "viem"
+import type { ChainWalletStore } from "$lib/wallet/types"
+import { derived, get, type Readable } from "svelte/store"
+import { bytesToHex, type OfflineSigner } from "@unionlabs/client"
+import { unionKeplrChainInfo, unionLeapChainInfo } from "$lib/wallet/cosmos/chain-info.ts"
 
 export const cosmosWalletsInformation = [
   {
     id: "leap",
     name: "leap",
-    icon: "https://assets.leapwallet.io/logos/leap-cosmos-logo.svg",
+    icon: "/images/icons/leap.svg",
     /**
      * reference links:
      * - leap deep link generator: https://developers.leapwallet.io/deeplink-generator
@@ -28,7 +28,7 @@ export const cosmosWalletsInformation = [
   {
     id: "keplr",
     name: "keplr",
-    icon: "https://assets-global.website-files.com/63eb7ddf41cf5b1c8fdfbc74/63fc1eaf76d6a3bd547b017c_Keplr_icon_ver.1.3_2.svg",
+    icon: "/images/icons/keplr.svg",
     deepLink:
       "https://deeplink.keplr.app?url=app.union.build#Intent;package=com.chainapsis.keplr;scheme=keplrwallet;end;",
     download: "https://keplr.app/download"
@@ -38,7 +38,10 @@ export const cosmosWalletsInformation = [
 export type CosmosWalletId = (typeof cosmosWalletsInformation)[number]["id"]
 
 function createCosmosStore(
-  previousState: ChainWalletStore<"cosmos"> = {
+  previousState: ChainWalletStore<"cosmos"> & {
+    rawAddress: Uint8Array | undefined
+    connectedWallet: CosmosWalletId | undefined
+  } = {
     chain: "cosmos",
     hoverState: "none",
     address: undefined,
@@ -56,9 +59,11 @@ function createCosmosStore(
     update,
     subscribe,
     connect: async (walletId: string) => {
+      console.info(walletId)
       if (!walletId || (walletId !== "keplr" && walletId !== "leap")) return
       update(v => ({ ...v, connectionStatus: "connecting", connectedWallet: walletId }))
       const walletApi = window[walletId]
+
       if (!walletApi) {
         const walletInfo = cosmosWalletsInformation.find(wallet => wallet.id === walletId)
         if (walletInfo) {
@@ -103,7 +108,7 @@ function createCosmosStore(
         }
         update(v => ({
           ...v,
-          connectedWallet: "none",
+          connectedWallet: undefined,
           connectionStatus: "disconnected",
           address: undefined,
           rawAddress: undefined
@@ -115,11 +120,21 @@ function createCosmosStore(
 
 export const cosmosStore = createCosmosStore()
 
+export const getCosmosOfflineSigner = ({
+  chainId,
+  connectedWallet
+}: {
+  chainId: string
+  connectedWallet: CosmosWalletId
+}): Promise<OfflineSigner> =>
+  // @ts-expect-error
+  window[connectedWallet]?.getOfflineSignerAuto(chainId, { disableBalanceCheck: false })
+
 export const userAddrCosmos: Readable<UserAddressCosmos | null> = derived(
   [cosmosStore],
   ([$cosmosStore]) => {
     if ($cosmosStore?.rawAddress && $cosmosStore?.address) {
-      const cosmos_normalized = rawToHex($cosmosStore.rawAddress)
+      const cosmos_normalized = bytesToHex($cosmosStore.rawAddress)
       return {
         canonical: $cosmosStore.address,
         normalized: cosmos_normalized,

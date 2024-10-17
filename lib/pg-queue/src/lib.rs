@@ -4,19 +4,21 @@ use std::{
 };
 
 use frame_support_procedural::{CloneNoBound, DebugNoBound};
-use queue_msg::{
-    optimize::{OptimizationResult, Pass, PurePass},
-    Op, QueueMessage,
-};
+use futures_util::TryStreamExt;
+use itertools::Itertools;
+use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{postgres::PgPoolOptions, prelude::FromRow, types::Json, Either, PgPool};
-use tracing::{debug, debug_span, info_span, trace, Instrument};
+use sqlx::{postgres::PgPoolOptions, prelude::FromRow, types::Json, Either, Executor, PgPool};
+use tracing::{debug, debug_span, info_span, instrument, trace, Instrument};
+use voyager_vm::{
+    filter::{FilterResult, InterestFilter},
+    pass::{Pass, PassResult},
+    Captures, Op, QueueMessage,
+};
 
 use crate::metrics::{ITEM_PROCESSING_DURATION, OPTIMIZE_ITEM_COUNT, OPTIMIZE_PROCESSING_DURATION};
 
 pub mod metrics;
-
-// pub static MIGRATOR: Migrator = sqlx::migrate!(); // defaults to "./migrations"
 
 /// A fifo queue backed by a postgres table. Not suitable for high-throughput, but enough for ~1k items/sec.
 ///
@@ -34,7 +36,7 @@ pub struct PgQueue<T> {
     __marker: PhantomData<fn() -> T>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PgQueueConfig {
     pub database_url: String,
@@ -69,7 +71,90 @@ struct Record {
     created_at: sqlx::types::time::OffsetDateTime,
 }
 
-impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
+#[derive(Debug, FromRow, Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct FailedRecord<T: QueueMessage> {
+    pub id: i64,
+    pub parents: Vec<i64>,
+    pub item: Json<Op<T>>,
+    pub message: String,
+    // pub created_at: sqlx::types::time::OffsetDateTime,
+}
+
+impl<T: QueueMessage> PgQueue<T> {
+    pub async fn query_failed(
+        &self,
+        page: i64,
+        per_page: i64,
+        mut item_filters: Vec<String>,
+        mut message_filters: Vec<String>,
+    ) -> Result<Vec<FailedRecord<T>>, sqlx::Error> {
+        // default to all-inclusive filter if none are provided
+        if item_filters.is_empty() {
+            item_filters.push("%".to_owned())
+        }
+
+        if message_filters.is_empty() {
+            message_filters.push("%".to_owned())
+        }
+
+        sqlx::query(
+            r#"
+            SELECT
+                id,
+                parents,
+                item,
+                message
+            FROM
+                failed 
+            WHERE
+                item::TEXT LIKE ANY($1) 
+                AND message LIKE ANY($2) 
+            ORDER BY
+                id DESC
+            LIMIT
+                $3
+            OFFSET
+                $4
+            "#,
+        )
+        .bind(item_filters)
+        .bind(message_filters)
+        .bind(per_page)
+        .bind((page - 1) * per_page)
+        .map(|row| FailedRecord::<T>::from_row(&row))
+        .fetch_all(&self.client)
+        .await?
+        .into_iter()
+        .collect()
+    }
+
+    pub async fn query_failed_by_id(
+        &self,
+        id: i64,
+    ) -> Result<Option<FailedRecord<T>>, sqlx::Error> {
+        sqlx::query(
+            r#"
+            SELECT
+               id,
+               parents,
+               item,
+               message
+            FROM
+               failed 
+            WHERE
+               id = $1
+            "#,
+        )
+        .bind(id)
+        .map(|row| FailedRecord::<T>::from_row(&row))
+        .fetch_optional(&self.client)
+        .await?
+        .transpose()
+    }
+}
+
+impl<T: QueueMessage> voyager_vm::Queue<T> for PgQueue<T> {
     type Config = PgQueueConfig;
     // type Error = tokio_postgres::Error;
     type Error = sqlx::Error;
@@ -86,23 +171,67 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
         //     }
         // });
 
+        let pool = config.into_pg_pool().await?;
+
+        pool.execute_many(
+            r#"
+            CREATE TABLE IF NOT EXISTS queue(
+                id BIGSERIAL PRIMARY KEY,
+                item JSONB NOT NULL,
+                parents BIGINT[] DEFAULT '{}',
+                created_at timestamptz NOT NULL DEFAULT now()
+            );
+
+            CREATE TABLE IF NOT EXISTS optimize(
+                -- TODO: Figure out how to do this properly
+                id BIGINT PRIMARY KEY DEFAULT nextval('queue_id_seq'::regclass),
+                item JSONB NOT NULL,
+                tag text NOT NULL,
+                parents BIGINT[] DEFAULT '{}',
+                created_at timestamptz NOT NULL DEFAULT now()
+            );
+
+            CREATE TABLE IF NOT EXISTS done(
+                id BIGINT,
+                item JSONB NOT NULL,
+                parents BIGINT[] DEFAULT '{}',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (id, created_at)
+            );
+
+            CREATE TABLE IF NOT EXISTS failed(
+                id BIGINT PRIMARY KEY,
+                item JSONB NOT NULL,
+                parents BIGINT[] DEFAULT '{}',
+                message TEXT,
+                created_at timestamptz NOT NULL DEFAULT now()
+            );
+
+            CREATE INDEX IF NOT EXISTS index_queue_id ON queue(id);
+            "#,
+        )
+        .try_for_each(
+            |result| async move { Ok(trace!("rows affected: {}", result.rows_affected())) },
+        )
+        .instrument(info_span!("init"))
+        .await?;
+
         Ok(Self {
-            client: config.into_pg_pool().await?,
+            client: pool,
             __marker: PhantomData,
         })
     }
 
-    async fn enqueue<'a, O: PurePass<T>>(
-        &'a self,
-        item: Op<T>,
-        pre_enqueue_passes: &'a O,
-    ) -> Result<(), Self::Error> {
+    async fn enqueue<'a>(&'a self, op: Op<T>, filter: &'a T::Filter) -> Result<(), Self::Error> {
         trace!("enqueue");
 
-        let OptimizationResult {
-            optimize_further,
-            ready,
-        } = pre_enqueue_passes.run_pass_pure(vec![item]);
+        let (optimize, ready): (Vec<_>, Vec<_>) =
+            op.normalize()
+                .into_iter()
+                .partition_map(|op| match filter.check_interest(&op) {
+                    FilterResult::Interest(tag) => Either::Left((op, tag)),
+                    FilterResult::NoInterest => Either::Right(op),
+                });
 
         let mut tx = self.client.begin().await?;
 
@@ -113,7 +242,7 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
             RETURNING id
             ",
         )
-        .bind(ready.into_iter().map(|x| Json(x.1)).collect::<Vec<_>>())
+        .bind(ready.into_iter().map(Json).collect::<Vec<_>>())
         .try_map(|x| Id::from_row(&x))
         .fetch_all(tx.as_mut())
         .await?;
@@ -124,17 +253,19 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
 
         let optimize_further_ids = sqlx::query(
             "
-            INSERT INTO optimize (item)
-            SELECT * FROM UNNEST($1::JSONB[])
+            INSERT INTO optimize (item, tag)
+            SELECT * FROM UNNEST($1::JSONB[], $2::TEXT[])
             RETURNING id
             ",
         )
         .bind(
-            optimize_further
+            optimize
+                .clone()
                 .into_iter()
-                .map(|x| Json(x.1))
+                .map(|x| Json(x.0))
                 .collect::<Vec<_>>(),
         )
+        .bind(optimize.into_iter().map(|x| x.1).collect::<Vec<_>>())
         .try_map(|x| Id::from_row(&x))
         .fetch_all(tx.as_mut())
         .await?;
@@ -148,16 +279,16 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
         Ok(())
     }
 
-    async fn process<'a, F, Fut, R, O>(
+    #[instrument(skip_all)]
+    async fn process<'a, F, Fut, R>(
         &'a self,
-        pre_reenqueue_passes: &'a O,
+        filter: &'a T::Filter,
         f: F,
     ) -> Result<Option<R>, Self::Error>
     where
-        F: (FnOnce(Op<T>) -> Fut) + Send + 'static,
-        Fut: Future<Output = (R, Result<Vec<Op<T>>, String>)> + Send + 'static,
+        F: (FnOnce(Op<T>) -> Fut) + Send + Captures<'a>,
+        Fut: Future<Output = (R, Result<Vec<Op<T>>, String>)> + Send + Captures<'a>,
         R: Send + Sync + 'static,
-        O: PurePass<T>,
     {
         trace!("process");
 
@@ -196,20 +327,20 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
                 trace!(%row.item);
 
                 // really don't feel like defining a new error type right now
-                let json = de(&row.item).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                let op = de(&row.item).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
                 let timer = ITEM_PROCESSING_DURATION.start_timer();
-                let (r, res) = f(json).instrument(span).await;
+                let (r, res) = f(op).instrument(span).await;
                 let _ = timer.stop_and_record();
 
                 match res {
                     Err(error) => {
-                        // Insert error message in the queue
+                        // insert error message and the op into failed
                         sqlx::query(
                             r#"
                             INSERT INTO
-                                failed (id, parents, item,      created_at, message)
-                                VALUES ($1, $2,      $3::JSONB, $4,         $5     )
+                            failed (id, parents, item,      created_at, message)
+                            VALUES ($1, $2,      $3::JSONB, $4,         $5     )
                             "#,
                         )
                         .bind(row.id)
@@ -221,61 +352,55 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
                         .await?;
                         tx.commit().await?;
                     }
-                    Ok(new_msgs) => {
-                        sqlx::query(
-                            "
-                            INSERT INTO
+                    Ok(ops) => {
+                        'block: {
+                            // insert the op we just processed into done
+                            sqlx::query(
+                                "
+                                INSERT INTO
                                 done   (id, parents, item,      created_at)
                                 VALUES ($1, $2,      $3::JSONB, $4        )
-                            ",
-                        )
-                        .bind(row.id)
-                        .bind(row.parents)
-                        .bind(row.item)
-                        .bind(row.created_at)
-                        .execute(tx.as_mut())
-                        .await?;
+                                ",
+                            )
+                            .bind(row.id)
+                            .bind(row.parents)
+                            .bind(row.item)
+                            .bind(row.created_at)
+                            .execute(tx.as_mut())
+                            .await?;
 
-                        let OptimizationResult {
-                            optimize_further,
-                            ready,
-                        } = pre_reenqueue_passes.run_pass_pure(new_msgs);
+                            if ops.is_empty() {
+                                break 'block;
+                            }
 
-                        let ready_ids = sqlx::query(
-                            "
-                            INSERT INTO queue (item)
-                            SELECT * FROM UNNEST($1::JSONB[])
-                            RETURNING id
-                            ",
-                        )
-                        .bind(ready.into_iter().map(|x| Json(x.1)).collect::<Vec<_>>())
-                        .try_map(|x| Id::from_row(&x))
-                        .fetch_all(tx.as_mut())
-                        .await?;
-
-                        for ready in ready_ids {
-                            debug!(id = ready.id, "enqueued item");
-                        }
-
-                        let optimize_further_ids = sqlx::query(
-                            "
-                            INSERT INTO optimize (item)
-                            SELECT * FROM UNNEST($1::JSONB[])
-                            RETURNING id
-                            ",
-                        )
-                        .bind(
-                            optimize_further
+                            let (optimize, ready): (Vec<_>, Vec<_>) = ops
                                 .into_iter()
-                                .map(|x| Json(x.1))
-                                .collect::<Vec<_>>(),
-                        )
-                        .try_map(|x| Id::from_row(&x))
-                        .fetch_all(tx.as_mut())
-                        .await?;
+                                .flat_map(Op::normalize)
+                                .partition_map(|op| match filter.check_interest(&op) {
+                                    FilterResult::Interest(tag) => Either::Left((op, tag)),
+                                    FilterResult::NoInterest => Either::Right(op),
+                                });
 
-                        for ready in optimize_further_ids {
-                            debug!(id = ready.id, "enqueued item");
+                            sqlx::query(
+                                "
+                                INSERT INTO queue (item)
+                                SELECT * FROM UNNEST($1::JSONB[])
+                                ",
+                            )
+                            .bind(ready.into_iter().map(Json).collect::<Vec<_>>())
+                            .execute(tx.as_mut())
+                            .await?;
+
+                            sqlx::query(
+                                "
+                                INSERT INTO optimize (item, tag)
+                                SELECT * FROM UNNEST($1::JSONB[], $2::TEXT[])
+                                ",
+                            )
+                            .bind(optimize.iter().map(|(op, _)| Json(op)).collect::<Vec<_>>())
+                            .bind(optimize.iter().map(|(_, tag)| *tag).collect::<Vec<_>>())
+                            .execute(tx.as_mut())
+                            .await?;
                         }
 
                         tx.commit().await?;
@@ -297,9 +422,10 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
 
     async fn optimize<'a, O: Pass<T>>(
         &'a self,
+        tag: &'a str,
         optimizer: &'a O,
     ) -> Result<(), Either<Self::Error, O::Error>> {
-        trace!("optimize");
+        trace!(%tag, "optimize");
 
         // if self.lock.swap(false, Ordering::SeqCst) {
         //     debug!("queue is locked");
@@ -318,6 +444,8 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
                   id
                 FROM
                   optimize
+                WHERE
+                  tag = $1
                 ORDER BY
                   id ASC
                 FOR UPDATE
@@ -330,6 +458,7 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
               created_at
             "#,
         )
+        .bind(tag)
         .try_map(|x| Record::from_row(&x))
         .fetch_all(tx.as_mut())
         .await
@@ -354,7 +483,8 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
 
         OPTIMIZE_ITEM_COUNT.observe(msgs.len() as f64);
         let timer = OPTIMIZE_PROCESSING_DURATION.start_timer();
-        let OptimizationResult {
+
+        let PassResult {
             optimize_further,
             ready,
         } = optimizer
@@ -384,21 +514,22 @@ impl<T: QueueMessage> queue_msg::Queue<T> for PgQueue<T> {
                 .collect::<Vec<_>>()
         };
 
-        for (parent_idxs, new_msg) in optimize_further {
+        for (parent_idxs, new_msg, tag) in optimize_further {
             let parents = get_parent_ids(&parent_idxs);
             trace!(parent_idxs = ?&parent_idxs, parents = ?&parents);
 
             let new_row = sqlx::query(
                 "
-                INSERT INTO queue (item, parents)
+                INSERT INTO optimize (item, parents, tag)
                 VALUES
-                    ($1::JSONB, $2)
+                    ($1::JSONB, $2, $3)
                 RETURNING id
                 ",
             )
             .bind(Json(new_msg))
             .bind(&parents)
-            .try_map(|x| Id::from_row(&x))
+            .bind(tag)
+            .try_map(|row| Id::from_row(&row))
             .fetch_one(tx.as_mut())
             .await
             .map_err(Either::Left)?;

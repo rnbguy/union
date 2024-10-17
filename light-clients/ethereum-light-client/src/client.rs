@@ -39,7 +39,6 @@ use unionlabs::{
         },
     },
     ics24::Path,
-    id::ClientId,
     uint::U256,
 };
 
@@ -165,7 +164,22 @@ impl IbcClient for EthereumLightClient {
             &proof_data.proof,
             &proof_data.storage_root,
         )
-        .map_err(Error::VerifyAccountStorageRoot)?;
+        .map_err(|err| {
+            Error::TestVerifyStorageProof(
+                err,
+                to_hex(
+                    &header
+                        .consensus_update
+                        .attested_header
+                        .execution
+                        .state_root
+                        .into_bytes(),
+                ),
+                to_hex(&wasm_client_state.data.ibc_contract_address.into_bytes()),
+                to_hex(&proof_data.proof.first().unwrap()),
+                to_hex(&proof_data.storage_root.into_bytes()),
+            )
+        });
 
         Ok(())
     }
@@ -493,15 +507,40 @@ pub fn do_verify_membership(
         &rlp::encode(&storage_proof.value),
         &storage_proof.proof,
     )
-    .map_err(|err| {
-        Error::TestVerifyStorageProof(
-            err,
-            to_hex(storage_root.into_bytes()),
-            storage_proof.key.to_be_hex(),
-            storage_proof.value.to_be_hex(),
-            to_hex(storage_proof.proof.first().unwrap()),
-        )
-    })
+    .map_err(Error::VerifyStorageProof)
+}
+
+// this is required because ibc-go requires the client state to be a protobuf Any, even though
+// the counterparty (ethereum in this case) stores it as raw bytes. this will no longer be
+// required with ibc-go v9.
+pub fn canonicalize_stored_value(
+    path: String,
+    raw_value: Vec<u8>,
+) -> Result<Vec<u8>, CanonicalizeStoredValueError> {
+    let path = path
+        .parse::<Path>()
+        .map_err(|_| CanonicalizeStoredValueError::UnknownIbcPath(path))?;
+
+    let canonical_value = match path {
+        // proto(any<cometbls>) -> ethabi(cometbls)
+        Path::ClientState(_) => {
+            Any::<cometbls::client_state::ClientState>::decode_as::<Proto>(raw_value.as_ref())
+                .map_err(CanonicalizeStoredValueError::CometblsClientStateDecode)?
+                .0
+                .encode_as::<EthAbi>()
+        }
+        // proto(any<wasm<cometbls>>) -> ethabi(cometbls)
+        Path::ClientConsensusState(_) => Any::<
+            wasm::consensus_state::ConsensusState<cometbls::consensus_state::ConsensusState>,
+        >::decode_as::<Proto>(raw_value.as_ref())
+        .map_err(CanonicalizeStoredValueError::CometblsConsensusStateDecode)?
+        .0
+        .data
+        .encode_as::<EthAbi>(),
+        _ => raw_value,
+    };
+
+    Ok(canonical_value)
 }
 
 /// Verifies that no value is committed at `path` in the counterparty light client's storage.
@@ -558,12 +597,11 @@ mod test {
         encoding::{Encode, Proto},
         ethereum::config::{Mainnet, Minimal},
         ibc::{core::connection::connection_end::ConnectionEnd, lightclients::ethereum},
-        id::ClientId,
     };
 
     use super::*;
-    use crate::client::test_utils::custom_query_handler;
     use crate::client::EthereumLightClient;
+    use crate::{client::test_utils::custom_query_handler, errors::Error};
 
     #[derive(Deserialize)]
     struct MembershipTest {
@@ -849,25 +887,40 @@ mod test {
     //    assert!(EthereumLightClient::verify_header(deps.as_ref(), env, update).is_err());
     //}
 
-    //#[test]
-    //fn membership_verification_works_for_client_state() {
-    //    do_membership_test::<
-    //        unionlabs::google::protobuf::any::Any<
-    //            wasm::client_state::ClientState<cometbls::client_state::ClientState>,
-    //        >,
-    //    >("src/test/memberships/valid_client_state.json")
-    //    .expect("Membership verification of client state failed");
-    //}
-    //
-    //#[test]
-    //fn membership_verification_works_for_consensus_state() {
-    //    do_membership_test::<
-    //        unionlabs::google::protobuf::any::Any<
-    //            wasm::consensus_state::ConsensusState<cometbls::consensus_state::ConsensusState>,
-    //        >,
-    //    >("src/test/memberships/valid_consensus_state.json")
-    //    .expect("Membership verification of client state failed");
-    //}
+    /*#[test]
+    fn verify_header_fails_when_finalized_header_execution_branch_merkle_is_invalid() {
+        let (deps, mut update, env) = prepare_test_data();
+        update.consensus_update.finalized_header.execution_branch[0].get_mut()[0] ^= u8::MAX;
+        assert!(EthereumLightClient::verify_header(deps.as_ref(), env, update).is_err());
+    }
+
+    #[test]
+    fn verify_header_fails_when_finality_branch_merkle_is_invalid() {
+        let (deps, mut update, env) = prepare_test_data();
+        update.consensus_update.finality_branch[0].get_mut()[0] ^= u8::MAX;
+        assert!(EthereumLightClient::verify_header(deps.as_ref(), env, update).is_err());
+    }*/
+
+    // TODO(aeryz): These won't work now since they now eth abi encoded
+    // #[test]
+    // fn membership_verification_works_for_client_state() {
+    //     do_membership_test::<
+    //         unionlabs::google::protobuf::any::Any<
+    //             wasm::client_state::ClientState<cometbls::client_state::ClientState>,
+    //         >,
+    //     >("src/test/memberships/valid_client_state.json")
+    //     .expect("Membership verification of client state failed");
+    // }
+
+    // #[test]
+    // fn membership_verification_works_for_consensus_state() {
+    //     do_membership_test::<
+    //         unionlabs::google::protobuf::any::Any<
+    //             wasm::consensus_state::ConsensusState<cometbls::consensus_state::ConsensusState>,
+    //         >,
+    //     >("src/test/memberships/valid_consensus_state.json")
+    //     .expect("Membership verification of client state failed");
+    // }
 
     #[test]
     fn gg() {
@@ -929,117 +982,121 @@ mod test {
         )
     }
 
-    //#[test]
-    //fn membership_verification_works_for_connection_end() {
-    //    do_membership_test::<ConnectionEnd<ClientId, ClientId>>(
-    //        "src/test/memberships/valid_connection_end.json",
-    //    )
-    //    .expect("Membership verification of client state failed");
-    //}
-    //
-    //#[test]
-    //fn membership_verification_fails_for_incorrect_proofs() {
-    //    let (mut proof, commitment_path, slot, storage_root, connection_end) =
-    //        membership_data::<ConnectionEnd<ClientId, ClientId>>(
-    //            "src/test/memberships/valid_connection_end.json",
-    //        );
-    //
-    //    let proofs = vec![
-    //        {
-    //            let mut proof = proof.clone();
-    //            proof.key.0 .0[0] ^= u64::MAX;
-    //            proof
-    //        },
-    //        {
-    //            proof.proof[0][10] ^= u8::MAX;
-    //            proof
-    //        },
-    //    ];
-    //
-    //    for proof in proofs {
-    //        assert!(do_verify_membership(
-    //            commitment_path.clone(),
-    //            storage_root,
-    //            slot,
-    //            proof,
-    //            connection_end.clone().encode_as::<Proto>(),
-    //        )
-    //        .is_err());
-    //    }
-    //}
-    //
-    //#[test]
-    //fn membership_verification_fails_for_incorrect_storage_root() {
-    //    let (proof, commitment_path, slot, mut storage_root, connection_end) =
-    //        membership_data::<ConnectionEnd<ClientId, ClientId>>(
-    //            "src/test/memberships/valid_connection_end.json",
-    //        );
-    //
-    //    storage_root.0[10] ^= u8::MAX;
-    //
-    //    assert!(do_verify_membership(
-    //        commitment_path,
-    //        storage_root,
-    //        slot,
-    //        proof,
-    //        connection_end.encode_as::<Proto>(),
-    //    )
-    //    .is_err());
-    //}
-    //
-    //#[test]
-    //fn membership_verification_fails_for_incorrect_data() {
-    //    let (proof, commitment_path, slot, storage_root, mut connection_end) =
-    //        membership_data::<ConnectionEnd<ClientId, ClientId>>(
-    //            "src/test/memberships/valid_connection_end.json",
-    //        );
-    //
-    //    connection_end.client_id =
-    //        unionlabs::validated::Validated::new("08-client-1".into()).unwrap();
-    //
-    //    assert!(do_verify_membership(
-    //        commitment_path,
-    //        storage_root,
-    //        slot,
-    //        proof,
-    //        connection_end.encode_as::<Proto>(),
-    //    )
-    //    .is_err());
-    //}
-    //
-    //#[test]
-    //fn non_membership_verification_works() {
-    //    let (proof, commitment_path, slot, storage_root, _) =
-    //        membership_data::<()>("src/test/memberships/valid_non_membership_proof.json");
-    //
-    //    do_verify_non_membership(commitment_path, storage_root, slot, proof)
-    //        .expect("Membership verification of client state failed");
-    //}
-    //
-    //#[test]
-    //fn non_membership_verification_fails_when_value_not_empty() {
-    //    let (proof, commitment_path, slot, storage_root, _) =
-    //        membership_data::<ConnectionEnd<ClientId, ClientId>>(
-    //            "src/test/memberships/valid_connection_end.json",
-    //        );
-    //    assert_eq!(
-    //        do_verify_non_membership(commitment_path, storage_root, slot, proof),
-    //        Err(Error::CounterpartyStorageNotNil)
-    //    );
-    //}
+    /*fn do_membership_test<T: serde::de::DeserializeOwned + Encode<Proto>>(
+        path: &str,
+    ) -> Result<(), Error> {
+        let (proof, commitment_path, slot, storage_root, expected_data) =
+            membership_data::<T>(path);
+        do_verify_membership(
+            commitment_path,
+            storage_root.as_ref().try_into().unwrap(),
+            slot,
+            proof,
+            expected_data.encode_as::<Proto>(),
+        )
+    }
 
-    //#[test]
-    //fn update_state_on_misbehaviour_works() {
-    //    let (mut deps, _, env) = prepare_test_data();
-    //
-    //    EthereumLightClient::update_state_on_misbehaviour(deps.as_mut(), env.clone(), Vec::new())
-    //        .unwrap();
-    //
-    //    assert_eq!(
-    //        EthereumLightClient::status(deps.as_ref(), &env),
-    //        Ok(Status::Frozen)
-    //    );
-    //}
+    #[test]
+    fn membership_verification_works_for_connection_end() {
+        do_membership_test::<ConnectionEnd>("src/test/memberships/valid_connection_end.json")
+            .expect("Membership verification of client state failed");
+    }
+
+    #[test]
+    fn membership_verification_fails_for_incorrect_proofs() {
+        let (mut proof, commitment_path, slot, storage_root, connection_end) =
+            membership_data::<ConnectionEnd>("src/test/memberships/valid_connection_end.json");
+
+        let proofs = vec![
+            {
+                let mut proof = proof.clone();
+                proof.key.0 .0[0] ^= u64::MAX;
+                proof
+            },
+            {
+                proof.proof[0][10] ^= u8::MAX;
+                proof
+            },
+        ];
+
+        for proof in proofs {
+            assert!(do_verify_membership(
+                commitment_path.clone(),
+                storage_root,
+                slot,
+                proof,
+                connection_end.clone().encode_as::<Proto>(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn membership_verification_fails_for_incorrect_storage_root() {
+        let (proof, commitment_path, slot, mut storage_root, connection_end) =
+            membership_data::<ConnectionEnd>("src/test/memberships/valid_connection_end.json");
+
+        storage_root.get_mut()[10] ^= u8::MAX;
+
+        assert!(do_verify_membership(
+            commitment_path,
+            storage_root,
+            slot,
+            proof,
+            connection_end.encode_as::<Proto>(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn membership_verification_fails_for_incorrect_data() {
+        let (proof, commitment_path, slot, storage_root, mut connection_end) =
+            membership_data::<ConnectionEnd>("src/test/memberships/valid_connection_end.json");
+
+        connection_end.client_id =
+            unionlabs::validated::Validated::new("08-client-1".into()).unwrap();
+
+        assert!(do_verify_membership(
+            commitment_path,
+            storage_root,
+            slot,
+            proof,
+            connection_end.encode_as::<Proto>(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn non_membership_verification_works() {
+        let (proof, commitment_path, slot, storage_root, _) =
+            membership_data::<()>("src/test/memberships/valid_non_membership_proof.json");
+
+        do_verify_non_membership(commitment_path, storage_root, slot, proof)
+            .expect("Membership verification of client state failed");
+    }
+
+    #[test]
+    fn non_membership_verification_fails_when_value_not_empty() {
+        let (proof, commitment_path, slot, storage_root, _) =
+            membership_data::<ConnectionEnd>("src/test/memberships/valid_connection_end.json");
+        assert_eq!(
+            do_verify_non_membership(commitment_path, storage_root, slot, proof),
+            Err(Error::CounterpartyStorageNotNil)
+        );
+    }
+
+    #[test]
+    fn update_state_on_misbehaviour_works() {
+        let (mut deps, _, env) = prepare_test_data();
+
+        EthereumLightClient::update_state_on_misbehaviour(deps.as_mut(), env.clone(), Vec::new())
+            .unwrap();
+
+        assert_eq!(
+            EthereumLightClient::status(deps.as_ref(), &env),
+            Ok(Status::Frozen)
+        );
+    }
 
     fn save_states_to_migrate_store(
         deps: DepsMut<UnionCustomQuery>,
@@ -1103,114 +1160,114 @@ mod test {
             )
             .unwrap(),
         )
+    }*/
+
+    /*#[test]
+    fn migrate_client_store_works() {
+        let (
+            mut deps,
+            mut wasm_client_state,
+            wasm_consensus_state,
+            substitute_wasm_client_state,
+            substitute_wasm_consensus_state,
+        ) = prepare_migrate_tests();
+
+        wasm_client_state.data.frozen_height = FROZEN_HEIGHT;
+
+        save_states_to_migrate_store(
+            deps.as_mut(),
+            &wasm_client_state,
+            &substitute_wasm_client_state,
+            &wasm_consensus_state,
+            &substitute_wasm_consensus_state,
+        );
+
+        EthereumLightClient::migrate_client_store(deps.as_mut()).unwrap();
+
+        let wasm_client_state: WasmClientState =
+            read_subject_client_state::<EthereumLightClient>(deps.as_ref()).unwrap();
+        // we didn't miss updating any fields
+        assert_eq!(wasm_client_state, substitute_wasm_client_state);
+        // client is unfrozen
+        assert_eq!(wasm_client_state.data.frozen_height, ZERO_HEIGHT);
+
+        // the new consensus state is saved under the correct height
+        assert_eq!(
+            read_subject_consensus_state::<EthereumLightClient>(
+                deps.as_ref(),
+                &INITIAL_SUBSTITUTE_CONSENSUS_STATE_HEIGHT
+            )
+            .unwrap()
+            .unwrap(),
+            substitute_wasm_consensus_state
+        )
     }
 
-    //#[test]
-    //fn migrate_client_store_works() {
-    //    let (
-    //        mut deps,
-    //        mut wasm_client_state,
-    //        wasm_consensus_state,
-    //        substitute_wasm_client_state,
-    //        substitute_wasm_consensus_state,
-    //    ) = prepare_migrate_tests();
-    //
-    //    wasm_client_state.data.frozen_height = FROZEN_HEIGHT;
-    //
-    //    save_states_to_migrate_store(
-    //        deps.as_mut(),
-    //        &wasm_client_state,
-    //        &substitute_wasm_client_state,
-    //        &wasm_consensus_state,
-    //        &substitute_wasm_consensus_state,
-    //    );
-    //
-    //    EthereumLightClient::migrate_client_store(deps.as_mut()).unwrap();
-    //
-    //    let wasm_client_state: WasmClientState =
-    //        read_subject_client_state::<EthereumLightClient>(deps.as_ref()).unwrap();
-    //    // we didn't miss updating any fields
-    //    assert_eq!(wasm_client_state, substitute_wasm_client_state);
-    //    // client is unfrozen
-    //    assert_eq!(wasm_client_state.data.frozen_height, ZERO_HEIGHT);
-    //
-    //    // the new consensus state is saved under the correct height
-    //    assert_eq!(
-    //        read_subject_consensus_state::<EthereumLightClient>(
-    //            deps.as_ref(),
-    //            &INITIAL_SUBSTITUTE_CONSENSUS_STATE_HEIGHT
-    //        )
-    //        .unwrap()
-    //        .unwrap(),
-    //        substitute_wasm_consensus_state
-    //    )
-    //}
-    //
-    //#[test]
-    //fn migrate_client_store_fails_when_invalid_change() {
-    //    let (
-    //        mut deps,
-    //        wasm_client_state,
-    //        wasm_consensus_state,
-    //        substitute_wasm_client_state,
-    //        substitute_wasm_consensus_state,
-    //    ) = prepare_migrate_tests();
-    //
-    //    macro_rules! modify_fns {
-    //        ($param:ident, $($m:expr), + $(,)?) => ([$(|$param: &mut ClientState| $m),+])
-    //    }
-    //
-    //    let modifications = modify_fns! { s,
-    //        s.genesis_time ^= u64::MAX,
-    //        s.genesis_validators_root.0[0] ^= u8::MAX,
-    //        s.seconds_per_slot ^= u64::MAX,
-    //        s.slots_per_epoch ^= u64::MAX,
-    //        s.epochs_per_sync_committee_period ^= u64::MAX,
-    //    };
-    //
-    //    for m in modifications {
-    //        let mut state = substitute_wasm_client_state.clone();
-    //        m(&mut state.data);
-    //
-    //        save_states_to_migrate_store(
-    //            deps.as_mut(),
-    //            &wasm_client_state,
-    //            &state,
-    //            &wasm_consensus_state,
-    //            &substitute_wasm_consensus_state,
-    //        );
-    //        assert_eq!(
-    //            EthereumLightClient::migrate_client_store(deps.as_mut()),
-    //            Err(Error::MigrateFieldsChanged.into())
-    //        );
-    //    }
-    //}
-    //
-    //#[test]
-    //fn migrate_client_store_fails_when_substitute_client_frozen() {
-    //    let (
-    //        mut deps,
-    //        wasm_client_state,
-    //        wasm_consensus_state,
-    //        mut substitute_wasm_client_state,
-    //        substitute_wasm_consensus_state,
-    //    ) = prepare_migrate_tests();
-    //
-    //    substitute_wasm_client_state.data.frozen_height = FROZEN_HEIGHT;
-    //
-    //    save_states_to_migrate_store(
-    //        deps.as_mut(),
-    //        &wasm_client_state,
-    //        &substitute_wasm_client_state,
-    //        &wasm_consensus_state,
-    //        &substitute_wasm_consensus_state,
-    //    );
-    //
-    //    assert_eq!(
-    //        EthereumLightClient::migrate_client_store(deps.as_mut()),
-    //        Err(Error::SubstituteClientFrozen.into())
-    //    );
-    //}
+    #[test]
+    fn migrate_client_store_fails_when_invalid_change() {
+        let (
+            mut deps,
+            wasm_client_state,
+            wasm_consensus_state,
+            substitute_wasm_client_state,
+            substitute_wasm_consensus_state,
+        ) = prepare_migrate_tests();
+
+        macro_rules! modify_fns {
+            ($param:ident, $($m:expr), + $(,)?) => ([$(|$param: &mut ClientState| $m),+])
+        }
+
+        let modifications = modify_fns! { s,
+            s.genesis_time ^= u64::MAX,
+            s.genesis_validators_root.get_mut()[0] ^= u8::MAX,
+            s.seconds_per_slot ^= u64::MAX,
+            s.slots_per_epoch ^= u64::MAX,
+            s.epochs_per_sync_committee_period ^= u64::MAX,
+        };
+
+        for m in modifications {
+            let mut state = substitute_wasm_client_state.clone();
+            m(&mut state.data);
+
+            save_states_to_migrate_store(
+                deps.as_mut(),
+                &wasm_client_state,
+                &state,
+                &wasm_consensus_state,
+                &substitute_wasm_consensus_state,
+            );
+            assert_eq!(
+                EthereumLightClient::migrate_client_store(deps.as_mut()),
+                Err(Error::MigrateFieldsChanged.into())
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_client_store_fails_when_substitute_client_frozen() {
+        let (
+            mut deps,
+            wasm_client_state,
+            wasm_consensus_state,
+            mut substitute_wasm_client_state,
+            substitute_wasm_consensus_state,
+        ) = prepare_migrate_tests();
+
+        substitute_wasm_client_state.data.frozen_height = FROZEN_HEIGHT;
+
+        save_states_to_migrate_store(
+            deps.as_mut(),
+            &wasm_client_state,
+            &substitute_wasm_client_state,
+            &wasm_consensus_state,
+            &substitute_wasm_consensus_state,
+        );
+
+        assert_eq!(
+            EthereumLightClient::migrate_client_store(deps.as_mut()),
+            Err(Error::SubstituteClientFrozen.into())
+        );
+    }*/
 }
 
 #[cfg(any(feature = "test-utils", test))]

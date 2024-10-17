@@ -29,9 +29,8 @@ impl<C> RaceClient<C> {
         }
     }
 
-    pub fn fastest(&self) -> &C {
-        let fastest = self.fastest.load(Ordering::Relaxed);
-        &self.clients[fastest]
+    pub fn fastest_index(&self) -> usize {
+        self.fastest.load(Ordering::Relaxed)
     }
 
     /// Run the provided closure over the clients, returning the first encountered Ok, or if all error, the first

@@ -1,68 +1,54 @@
-module IBC::LightClient {
-    use IBC::proto_utils;
-    use std::option;
+module ibc::light_client {
     use std::vector;
-    use std::from_bcs;
     use std::bcs;
-    use std::hash;
-    use std::any::Any;
-    use std::string::{Self, String, utf8};
-    use std::bn254_algebra::{Fr, FormatFrMsb, FormatFrLsb, G1, FormatG1Uncompr, G2, Gt, FormatG2Compr};
-    use std::crypto_algebra::{deserialize, serialize, zero, add, scalar_mul, multi_pairing, Element, eq};
-    use std::aptos_hash;
-    use IBC::height::{Self, Height};
+    use std::string::{Self, String};
+    use ibc::height::{Self, Height};
     use aptos_std::smart_table::{Self, SmartTable};
     use std::object;
     use std::timestamp;
-    use IBC::ics23;
+    use ibc::ics23;
+    use ibc::bcs_utils;
+    use ibc::groth16_verifier::{Self, ZKP};
 
-    const ALPHA_G1: vector<u8> = x"99a818c167016f7f6d02d84005a5ed1f7c6c19c4ddf15733b67acc0129076709ff810d9d3374808069c1ea1e5d263a90cf8181b98b415805797176357acec708";
-    const BETA_G2: vector<u8> = x"742884ea18a00ef31874d5fc5511b18fa9391dc69b971b898a2dbfc644033f15656dc92f1f94dc170026cd80212e5160d2539e7e8b40885d1d60b770d25f3599";
-    const GAMMA_G2: vector<u8> = x"19b6719e42c42ed1df46fa08c870c5241a52913b65d9b43679e089c2e0bb1622cf3a489ca7927f4f81400a2ebd739a935bceb3224264eff8e248311ae96be7a0";
-    const DELTA_G2: vector<u8> = x"eb044ddb951e9b28eda7da93aba341ef2c96a4d6182ca785a32018c9c803d405fcb9f04a31c988a2f5a64710ffafe101831d6147259b54e45d47e0d1184c5e29";
-    const PEDERSEN_G: vector<u8> = x"5ae56dc014a8137712f4584658ba6f7e390cc39892f97e56ca859887d8d8f0138719bd9ffa2bba963951da2e08ba92ffc1049ba2f1fd7d7f03b02c13f8f67d25";
-    const PEDERSEN_G_ROOT_SIGMA_NEG: vector<u8> = x"af5b4e30123a344339321dd621b5fdf9cd9870625928fa07235f011cdf04a1026863cae2f2b0c0ce457e81ad25a068fb1cb86026096be8e3f75c55a741e1bfaf";
-    const GAMMA_ABC_G1: vector<vector<u8>> = vector[x"81925330941d53d8cec1c44210f6c882fee82c4ae97cb64b4f864327e54318270624cb7325a89fea7ad2cbde478a7ba38eca18bba1f024f672b1f89cc6423325" ,
-    x"ca4b125d5e1a2ec0e22672434fbe9ca0e3ca15b0c20e16e9020ed6f471be0d0b0ce070b6a8b95f687014d83de09f9efe33caaf16aa92e5ec888376d3eb9a0b13"
-    , x"c790c4a1918ab12e7e3c36005b2f5cbcf5408ced98033571760c7cf4d5939e02d9f1ee6a9c13b6ebbe2e11dab23f5600040fcb833bb5798faecf9d451005f12c"];
-    const HMAC_O: vector<u8> = x"1F333139281E100F5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C5C";
-    const HMAC_I: vector<u8> = x"75595B5342747A653636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636";
-    const PRIME_R_MINUS_ONE: vector<u8> = x"000000f093f5e1439170b97948e833285d588181b64550b829a031e1724e6430";
+    const E_INVALID_CLIENT_STATE: u64 = 35100;
+    const E_CONSENSUS_STATE_TIMESTAMP_ZERO: u64 = 35101;
+    const E_SIGNED_HEADER_HEIGHT_NOT_MORE_RECENT: u64 = 35102;
+    const E_SIGNED_HEADER_TIMESTAMP_NOT_MORE_RECENT: u64 = 35103;
+    const E_HEADER_EXCEEDED_TRUSTING_PERIOD: u64 = 35104;
+    const E_HEADER_EXCEEDED_MAX_CLOCK_DRIFT: u64 = 35105;
+    const E_VALIDATORS_HASH_MISMATCH: u64 = 35106;
+    const E_INVALID_ZKP: u64 = 35107;
+    const E_FROZEN_CLIENT: u64 = 35108;
+    const E_INVALID_MISBEHAVIOUR: u64 = 35109;
+    const E_UNIMPLEMENTED: u64 = 35199;
 
     struct State has key, store {
         client_state: ClientState,
         consensus_states: SmartTable<height::Height, ConsensusState>
     }
 
-    struct Proof has drop {
-        a: Element<G1>,
-        b: Element<G2>,
-        c: Element<G1>,
-    }
-
-    struct ZKP has drop {
-        proof: Proof,
-        proof_commitment: Element<G1>,
-        proof_commitment_pok: Element<G1>,
-    }
-
     struct Timestamp has drop, copy {
         seconds: u64,
-        nanos: u32,
+        nanos: u32
     }
 
-    struct LightHeader has drop {
+    struct LightHeader has drop, copy {
         height: u64,
         time: Timestamp,
         validators_hash: vector<u8>,
         next_validators_hash: vector<u8>,
-        app_hash: vector<u8>,
+        app_hash: vector<u8>
     }
 
     struct Header has drop {
         signed_header: LightHeader,
         trusted_height: height::Height,
-        zero_knowledge_proof: ZKP,
+        zero_knowledge_proof: ZKP
+    }
+
+    struct Misbehaviour has drop {
+        header_a: Header,
+        header_b: Header
     }
 
     struct ClientState has copy, drop, store {
@@ -71,7 +57,7 @@ module IBC::LightClient {
         unbonding_period: u64,
         max_clock_drift: u64,
         frozen_height: height::Height,
-        latest_height: height::Height,
+        latest_height: height::Height
     }
 
     struct MerkleRoot has copy, drop, store {
@@ -87,160 +73,206 @@ module IBC::LightClient {
     // Function to mock the creation of a client
     public fun create_client(
         ibc_signer: &signer,
-        client_id: String, 
-        client_state_bytes: vector<u8>, 
-        consensus_state_bytes: vector<u8>,
-    ): (u64, vector<u8>, vector<u8>) {
+        client_id: String,
+        client_state_bytes: vector<u8>,
+        consensus_state_bytes: vector<u8>
+    ): (vector<u8>, vector<u8>) {
         let client_state = decode_client_state(client_state_bytes);
         let consensus_state = decode_consensus_state(consensus_state_bytes);
-        
-        if (height::get_revision_height(&client_state.latest_height) == 0 || consensus_state.timestamp == 0) {
-            return (1, vector::empty(), vector::empty())
-        };
 
-        if (string::length(&client_state.chain_id) > 31) {
-            return (1, vector::empty(), vector::empty())
-        };
+        assert!(
+            height::get_revision_height(&client_state.latest_height) != 0
+                && consensus_state.timestamp != 0,
+            E_INVALID_CLIENT_STATE
+        );
+
+        assert!(string::length(&client_state.chain_id) <= 31, E_INVALID_CLIENT_STATE);
 
         let consensus_states = smart_table::new<height::Height, ConsensusState>();
-        smart_table::upsert<height::Height, ConsensusState>(&mut consensus_states, client_state.latest_height, consensus_state);
+        smart_table::upsert<height::Height, ConsensusState>(
+            &mut consensus_states, client_state.latest_height, consensus_state
+        );
 
-        let state = State {
-            client_state: client_state,
-            consensus_states: consensus_states
-        };
+        let state = State { client_state: client_state, consensus_states: consensus_states };
 
-        let store_constructor = object::create_named_object(ibc_signer, *string::bytes(&client_id));
+        let store_constructor =
+            object::create_named_object(ibc_signer, *string::bytes(&client_id));
         let client_signer = object::generate_signer(&store_constructor);
 
         move_to(&client_signer, state);
-        
-        (0, client_state_bytes, consensus_state_bytes)
+
+        (client_state_bytes, consensus_state_bytes)
     }
 
-    public fun latest_height(
-        client_id: String
-    ): height::Height acquires State {
+    public fun latest_height(client_id: String): height::Height acquires State {
         // Return error code, 0 for success
         let state = borrow_global<State>(get_client_address(&client_id));
         state.client_state.latest_height
     }
 
-    fun verify_header(
-        header: &Header,
-        state: &State,
-        consensus_state: &ConsensusState
-    ): u64 {
-        if (consensus_state.timestamp == 0) {
-            return 1
-        };
+    public fun verify_header(
+        header: &Header, state: &State, consensus_state: &ConsensusState
+    ) {
+        assert!(consensus_state.timestamp != 0, E_CONSENSUS_STATE_TIMESTAMP_ZERO);
 
         let untrusted_height_number = header.signed_header.height;
         let trusted_height_number = height::get_revision_height(&header.trusted_height);
 
-        if (untrusted_height_number <= trusted_height_number) {
-            return 1
-        };
+        assert!(
+            untrusted_height_number > trusted_height_number,
+            E_SIGNED_HEADER_HEIGHT_NOT_MORE_RECENT
+        );
 
         let trusted_timestamp = consensus_state.timestamp;
-        let untrusted_timestamp = header.signed_header.time.seconds * 1_000_000_000 + (header.signed_header.time.nanos as u64);
-        if (untrusted_timestamp <= trusted_timestamp) {
-            return 1  
-        };
+        let untrusted_timestamp =
+            header.signed_header.time.seconds * 1_000_000_000
+                + (header.signed_header.time.nanos as u64);
+        assert!(
+            untrusted_timestamp > trusted_timestamp,
+            E_SIGNED_HEADER_TIMESTAMP_NOT_MORE_RECENT
+        );
 
         let current_time = timestamp::now_seconds() * 1_000_000_000;
-        if (untrusted_timestamp> (current_time + state.client_state.trusting_period)) {
-            return 1  
-        };
+        assert!(
+            untrusted_timestamp < current_time + state.client_state.trusting_period,
+            E_HEADER_EXCEEDED_TRUSTING_PERIOD
+        );
 
-        if (untrusted_timestamp >= current_time + state.client_state.max_clock_drift) {
-            return 1  
-        };
+        assert!(
+            untrusted_timestamp < current_time + state.client_state.max_clock_drift,
+            E_HEADER_EXCEEDED_MAX_CLOCK_DRIFT
+        );
 
         if (untrusted_height_number == trusted_height_number + 1) {
-            if (header.signed_header.validators_hash != consensus_state.next_validators_hash) {
-                return 1
-            };
+            assert!(
+                header.signed_header.validators_hash
+                    == consensus_state.next_validators_hash,
+                E_VALIDATORS_HASH_MISMATCH
+            );
         };
 
-        if (verify_zkp(
-            &state.client_state.chain_id,
-            &consensus_state.next_validators_hash,
-            &header.signed_header,
-            &header.zero_knowledge_proof,
-        )) {
-            return 1
-        };
-
-        0
+        assert!(
+            groth16_verifier::verify_zkp(
+                &state.client_state.chain_id,
+                &consensus_state.next_validators_hash,
+                light_header_as_input_hash(&header.signed_header),
+                &header.zero_knowledge_proof
+            ),
+            E_INVALID_ZKP
+        );
     }
 
     public fun update_client(
-        client_id: String,
-        client_msg: vector<u8>
-    ): (vector<u8>, vector<vector<u8>>, vector<height::Height>, u64) acquires State {
+        client_id: String, client_msg: vector<u8>
+    ): (vector<u8>, vector<vector<u8>>, vector<height::Height>) acquires State {
         let header = decode_header(client_msg);
 
         let state = borrow_global_mut<State>(get_client_address(&client_id));
 
-        if (height::is_zero(&state.client_state.frozen_height)) {
-            return (vector::empty(), vector::empty(), vector::empty(), 1)
-        };
+        assert!(height::is_zero(&state.client_state.frozen_height), E_FROZEN_CLIENT);
 
-        let consensus_state = smart_table::borrow<height::Height, ConsensusState>(&state.consensus_states, header.trusted_height);
+        let consensus_state =
+            smart_table::borrow<height::Height, ConsensusState>(
+                &state.consensus_states, header.trusted_height
+            );
 
-        let err = verify_header(&header, state, consensus_state);
-        if (err != 0) {
-            return (vector::empty(), vector::empty(), vector::empty(), err)
-        };
+        verify_header(&header, state, consensus_state);
 
         let untrusted_height_number = header.signed_header.height;
-        let untrusted_timestamp = header.signed_header.time.seconds * 1_000_000_000 + (header.signed_header.time.nanos as u64);
+        let untrusted_timestamp =
+            header.signed_header.time.seconds * 1_000_000_000
+                + (header.signed_header.time.nanos as u64);
 
-        if (untrusted_height_number > height::get_revision_height(&state.client_state.latest_height)) {
-            height::set_revision_height(&mut state.client_state.latest_height, untrusted_height_number);
+        if (untrusted_height_number
+            > height::get_revision_height(&state.client_state.latest_height)) {
+            height::set_revision_height(
+                &mut state.client_state.latest_height, untrusted_height_number
+            );
         };
 
-        let new_height = height::new(height::get_revision_number(&state.client_state.latest_height), untrusted_height_number);
+        let new_height =
+            height::new(
+                height::get_revision_number(&state.client_state.latest_height),
+                untrusted_height_number
+            );
 
         let new_consensus_state = ConsensusState {
             timestamp: untrusted_timestamp,
-            app_hash: MerkleRoot {
-                hash: header.signed_header.app_hash,
-            },
+            app_hash: MerkleRoot { hash: header.signed_header.app_hash },
             next_validators_hash: header.signed_header.next_validators_hash
         };
 
-        smart_table::upsert<height::Height, ConsensusState>(&mut state.consensus_states, new_height, new_consensus_state);
+        smart_table::upsert<height::Height, ConsensusState>(
+            &mut state.consensus_states, new_height, new_consensus_state
+        );
 
         (
-            encode_client_state(state.client_state),
-            vector<vector<u8>>[encode_consensus_state(new_consensus_state)],
-            vector<height::Height>[
-                new_height
-            ],
-            0
+            bcs::to_bytes(&state.client_state),
+            vector[encode_consensus_state(&new_consensus_state)],
+            vector[new_height]
         )
     }
 
-    public fun verify_membership(
-        _client_id: String,
-        _height: height::Height,
-        _proof: vector<u8>,
-        _prefix: vector<u8>,
-        _path: vector<u8>,
-        _value: vector<u8>, 
-    ): u64 {
-        // let consensus_state = smart_table::borrow(&borrow_global<State>(get_client_address(&client_id)).consensus_states, height);
-        // let proof = any::unpack<ics23::MembershipProof>(proof);
+    // Checks whether `misbehaviour` is valid and freezes the client
+    public fun report_misbehaviour(
+        client_id: String, misbehaviour: vector<u8>
+    ) acquires State {
+        let Misbehaviour { header_a, header_b } = decode_misbehaviour(misbehaviour);
 
-        // ics23::verify_membership(
-        //     proof,
-        //     consensus_state.app_hash.hash,
-        //     prefix,
-        //     path,
-        //     value
-        // )
+        assert!(
+            header_a.signed_header.height >= header_b.signed_header.height,
+            E_INVALID_MISBEHAVIOUR
+        );
+
+        let state = borrow_global_mut<State>(get_client_address(&client_id));
+
+        let consensus_state_a =
+            smart_table::borrow(&state.consensus_states, header_a.trusted_height);
+        let consensus_state_b =
+            smart_table::borrow(&state.consensus_states, header_b.trusted_height);
+
+        // verify both updates would have been accepted by the light client
+        verify_header(&header_a, state, consensus_state_a);
+        verify_header(&header_b, state, consensus_state_b);
+
+        if (header_a.signed_header.height == header_b.signed_header.height) {
+            // misbehaviour is only valid if
+            assert!(
+                header_a.signed_header == header_b.signed_header,
+                E_INVALID_MISBEHAVIOUR
+            );
+        } else {
+            assert!(
+                consensus_state_a.timestamp > consensus_state_b.timestamp,
+                E_INVALID_MISBEHAVIOUR
+            );
+        };
+
+        state.client_state.frozen_height = height::new(0, 1);
+    }
+
+    public fun verify_membership(
+        client_id: String,
+        height: height::Height,
+        proof: vector<u8>,
+        prefix: vector<u8>,
+        path: vector<u8>,
+        value: vector<u8>
+    ): u64 acquires State {
+        let consensus_state =
+            smart_table::borrow(
+                &borrow_global<State>(get_client_address(&client_id)).consensus_states,
+                height
+            );
+
+        ics23::verify_membership(
+            ics23::decode_membership_proof(proof),
+            consensus_state.app_hash.hash,
+            prefix,
+            path,
+            value
+        );
+
         0
     }
 
@@ -249,45 +281,207 @@ module IBC::LightClient {
         _height: height::Height,
         _proof: vector<u8>,
         _prefix: vector<u8>,
-        _path: vector<u8>,
+        _path: vector<u8>
     ): u64 {
         0
     }
 
+    public fun status(_client_id: &String): u64 {
+        // TODO(aeryz): fetch these status from proper exported consts
+        0
+    }
+
     fun get_client_address(client_id: &string::String): address {
-        object::create_object_address(&@IBC, *string::bytes(client_id))
+        let vault_addr = object::create_object_address(&@ibc, b"IBC_VAULT_SEED");
+
+        object::create_object_address(&vault_addr, *string::bytes(client_id))
     }
 
-   fun hmac_keccak(message: &vector<u8>): vector<u8> {
-        let inner = HMAC_I;
-        vector::append(&mut inner, *message);
-        let outer = HMAC_O;
-        vector::append(&mut outer, aptos_hash::keccak256(inner));
-
-        aptos_hash::keccak256(outer)
+    public fun new_client_state(
+        chain_id: string::String,
+        trusting_period: u64,
+        unbonding_period: u64,
+        max_clock_drift: u64,
+        frozen_height: height::Height,
+        latest_height: height::Height
+    ): ClientState {
+        ClientState {
+            chain_id: chain_id,
+            trusting_period: trusting_period,
+            unbonding_period: unbonding_period,
+            max_clock_drift: max_clock_drift,
+            frozen_height: frozen_height,
+            latest_height: latest_height
+        }
     }
 
-    fun hash_commitment(proof_commitment: &Element<G1>): u256 {
-        let buffer = serialize<G1, FormatG1Uncompr>(proof_commitment);
-        vector::reverse_slice(&mut buffer, 0, 32);
-        vector::reverse_slice(&mut buffer, 32, 64);
-        let hmac = hmac_keccak(&buffer);
-        vector::reverse(&mut hmac);
-
-        let prime_r_minus_one = from_bcs::to_u256(PRIME_R_MINUS_ONE);
-        let hmac = from_bcs::to_u256(hmac);
-
-        (hmac % prime_r_minus_one) + 1
+    public fun new_consensus_state(
+        timestamp: u64, app_hash: MerkleRoot, next_validators_hash: vector<u8>
+    ): ConsensusState {
+        ConsensusState {
+            timestamp: timestamp,
+            app_hash: app_hash,
+            next_validators_hash: next_validators_hash
+        }
     }
-    
-    fun verify_zkp(chain_id: &String, trusted_validators_hash: &vector<u8>, header: &LightHeader, zkp: &ZKP): bool {
-        let inputs_hash: vector<u8> = vector::empty();
-        let i = 0;
-        while (i < 32 - string::length(chain_id)) {
-            vector::push_back(&mut inputs_hash, 0);
-            i = i + 1;
+
+    public fun new_merkle_root(hash: vector<u8>): MerkleRoot {
+        MerkleRoot { hash: hash }
+    }
+
+    public fun get_timestamp_at_height(
+        client_id: String, height: height::Height
+    ): u64 acquires State {
+        let state = borrow_global<State>(get_client_address(&client_id));
+        let consensus_state = smart_table::borrow(&state.consensus_states, height);
+        consensus_state.timestamp
+    }
+
+    public fun get_client_state(client_id: String): vector<u8> acquires State {
+        let state = borrow_global<State>(get_client_address(&client_id));
+        bcs::to_bytes(&state.client_state)
+    }
+
+    public fun get_consensus_state(client_id: String, height: Height): vector<u8> acquires State {
+        let state = borrow_global<State>(get_client_address(&client_id));
+        let consensus_state = smart_table::borrow(&state.consensus_states, height);
+        encode_consensus_state(consensus_state)
+    }
+
+    public fun mock_create_client(): (vector<u8>, vector<u8>) {
+        let client_state = ClientState {
+            chain_id: string::utf8(b"this-chain"),
+            trusting_period: 0,
+            unbonding_period: 0,
+            max_clock_drift: 0,
+            frozen_height: height::new(0, 0),
+            latest_height: height::new(0, 1000)
         };
-        vector::append(&mut inputs_hash, *string::bytes(chain_id));
+
+        let consensus_state = ConsensusState {
+            timestamp: 10000,
+            app_hash: MerkleRoot {
+                hash: x"0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            next_validators_hash: x"0000000000000000000000000000000000000000000000000000000000000000"
+        };
+
+        let data1 = bcs::to_bytes(&client_state);
+        let data2 = encode_consensus_state(&consensus_state);
+        return (data1, data2)
+    }
+
+    public fun check_for_misbehaviour(
+        client_id: String, header: vector<u8>
+    ): bool acquires State {
+        let state = borrow_global_mut<State>(get_client_address(&client_id));
+
+        let header = decode_header(header);
+
+        let height = height_from_header(&header);
+
+        let expected_timestamp =
+            header.signed_header.time.seconds * 1_000_000_000
+                + (header.signed_header.time.nanos as u64);
+
+        if (smart_table::contains(&state.consensus_states, height)) {
+            let ConsensusState {
+                timestamp,
+                app_hash: MerkleRoot { hash },
+                next_validators_hash
+            } = smart_table::borrow(&state.consensus_states, height);
+
+            if (timestamp != &expected_timestamp
+                || hash != &header.signed_header.app_hash
+                || next_validators_hash != &header.signed_header.next_validators_hash) {
+                state.client_state.frozen_height = height::new(0, 1);
+            };
+        };
+
+        // TODO(aeryz): implement consensus state metadata tracking here
+        false
+    }
+
+    fun height_from_header(header: &Header): Height {
+        height::new(
+            height::get_revision_height(&header.trusted_height),
+            header.signed_header.height
+        )
+    }
+
+    fun decode_client_state(buf: vector<u8>): ClientState {
+        let buf = bcs_utils::new(buf);
+
+        ClientState {
+            chain_id: bcs_utils::peel_string(&mut buf),
+            trusting_period: bcs_utils::peel_u64(&mut buf),
+            unbonding_period: bcs_utils::peel_u64(&mut buf),
+            max_clock_drift: bcs_utils::peel_u64(&mut buf),
+            frozen_height: height::decode_bcs(&mut buf),
+            latest_height: height::decode_bcs(&mut buf)
+        }
+    }
+
+    fun decode_consensus_state(buf: vector<u8>): ConsensusState {
+        let buf = bcs_utils::new(buf);
+
+        ConsensusState {
+            timestamp: bcs_utils::peel_u64(&mut buf),
+            app_hash: MerkleRoot { hash: bcs_utils::peel_fixed_bytes(&mut buf, 32) },
+            next_validators_hash: bcs_utils::peel_fixed_bytes(&mut buf, 32)
+        }
+    }
+
+    fun encode_consensus_state(cs: &ConsensusState): vector<u8> {
+        let buf = vector::empty();
+
+        vector::append(&mut buf, bcs::to_bytes(&cs.timestamp));
+        vector::append(&mut buf, cs.app_hash.hash);
+        vector::append(&mut buf, cs.next_validators_hash);
+
+        buf
+    }
+
+    fun decode_header(buf: vector<u8>): Header {
+        let buf = bcs_utils::new(buf);
+        peel_header(&mut buf)
+    }
+
+    fun peel_header(buf: &mut bcs_utils::BcsBuf): Header {
+        let height = bcs_utils::peel_u64(buf);
+
+        let time = Timestamp {
+            seconds: bcs_utils::peel_u64(buf),
+            nanos: bcs_utils::peel_u32(buf)
+        };
+
+        let signed_header = LightHeader {
+            height,
+            time,
+            validators_hash: bcs_utils::peel_fixed_bytes(buf, 32),
+            next_validators_hash: bcs_utils::peel_fixed_bytes(buf, 32),
+            app_hash: bcs_utils::peel_fixed_bytes(buf, 32)
+        };
+
+        let trusted_height = height::decode_bcs(buf);
+
+        let proof_bz = bcs_utils::peel_bytes(buf);
+        let zero_knowledge_proof = groth16_verifier::parse_zkp(proof_bz);
+
+        Header { signed_header, trusted_height, zero_knowledge_proof }
+    }
+
+    fun decode_misbehaviour(buf: vector<u8>): Misbehaviour {
+        let buf = bcs_utils::new(buf);
+
+        Misbehaviour {
+            header_a: peel_header(&mut buf),
+            header_b: peel_header(&mut buf)
+        }
+    }
+
+    public fun light_header_as_input_hash(header: &LightHeader): vector<u8> {
+        let inputs_hash = vector::empty();
 
         let height = bcs::to_bytes<u256>(&(header.height as u256));
         vector::reverse(&mut height);
@@ -302,556 +496,209 @@ module IBC::LightClient {
         vector::append(&mut inputs_hash, header.validators_hash);
         vector::append(&mut inputs_hash, header.next_validators_hash);
         vector::append(&mut inputs_hash, header.app_hash);
-        vector::append(&mut inputs_hash, *trusted_validators_hash);
 
-        let inputs_hash = hash::sha2_256(inputs_hash);
+        inputs_hash
+    }
 
-        let x = vector::borrow_mut(&mut inputs_hash, 0);
-        *x = 0;
-
-        let inputs_hash = std::option::extract(&mut deserialize<Fr, FormatFrMsb>(&inputs_hash));
-        let commitment_hash = hash_commitment(&zkp.proof_commitment);
-        let hmac = bcs::to_bytes(&commitment_hash);
-        let commitment_hash = std::option::extract(&mut deserialize<Fr, FormatFrLsb>(&hmac));
-
-        let alpha_g1 = std::option::extract(&mut deserialize<G1, FormatG1Uncompr>(&ALPHA_G1));
-
-        let beta_g2 = std::option::extract(&mut deserialize<G2, FormatG2Compr>(&BETA_G2));
-
-        let gamma_g2 = std::option::extract(&mut deserialize<G2, FormatG2Compr>(&GAMMA_G2));
-        let delta_g2 = std::option::extract(&mut deserialize<G2, FormatG2Compr>(&DELTA_G2));
-        let pedersen_g = std::option::extract(&mut deserialize<G2, FormatG2Compr>(&PEDERSEN_G));
-        let pedersen_g_root_sigma_neg = std::option::extract(&mut deserialize<G2, FormatG2Compr>(&PEDERSEN_G_ROOT_SIGMA_NEG));
-
-        let gamma_abc_1 = std::option::extract(&mut deserialize<G1, FormatG1Uncompr>(vector::borrow(&mut GAMMA_ABC_G1, 0)));
-        let gamma_abc_2 = std::option::extract(&mut deserialize<G1, FormatG1Uncompr>(vector::borrow(&mut GAMMA_ABC_G1, 1)));
-        let gamma_abc_3 = std::option::extract(&mut deserialize<G1, FormatG1Uncompr>(vector::borrow(&mut GAMMA_ABC_G1, 2)));
-
-        // TODO(aeryz): why is this unused?
-        let _res = serialize<Fr, FormatFrLsb>(&commitment_hash);
-
-        let msm_inner = add(&add<G1>(&gamma_abc_1, &zkp.proof_commitment), &scalar_mul<G1, Fr>(&gamma_abc_2, &inputs_hash));
-        let public_inputs_msm = add<G1>(&msm_inner, &scalar_mul<G1, Fr>(&gamma_abc_3, &commitment_hash));
-        let res = serialize<G1, FormatG1Uncompr>(&public_inputs_msm);
-        vector::reverse_slice(&mut res, 0, 32);
-        vector::reverse_slice(&mut res, 32, 64);
-
-        let res = multi_pairing<G1, G2, Gt>(
-            &vector<Element<G1>>[
-                zkp.proof.a, public_inputs_msm, zkp.proof.c, alpha_g1
-            ],
-            &vector<Element<G2>>[
-                zkp.proof.b, gamma_g2, delta_g2, beta_g2
-            ]
-        );
-
-        if (!eq<Gt>(&res, &zero<Gt>())) {
-            return false
+    #[test]
+    fun parse_client_state() {
+        let client_state = ClientState {
+            chain_id: string::utf8(b"this-chain"),
+            trusting_period: 9999999,
+            unbonding_period: 12367,
+            max_clock_drift: 0,
+            frozen_height: height::new(11, 1273),
+            latest_height: height::new(127638, 1000)
         };
 
-        let res = multi_pairing<G1, G2, Gt>(
-            &vector<Element<G1>>[
-                zkp.proof_commitment, zkp.proof_commitment_pok
-            ],
-            &vector<Element<G2>>[
-                pedersen_g, pedersen_g_root_sigma_neg
-            ]
-        );
-
-        eq<Gt>(&res, &zero<Gt>())        
+        let cs = decode_client_state(bcs::to_bytes(&client_state));
+        std::debug::print(&cs);
     }
 
-    // #[test(ibc_signer = @IBC)]
-    // fun test_create_client(ibc_signer: &signer) acquires State {
-    //     let client_state = ClientState {
-    //         chain_id: string::utf8(b"this-chain"),
-    //         trusting_period: 0,
-    //         unbonding_period: 0,
-    //         max_clock_drift: 0,
-    //         frozen_height: height::new(0, 0),
-    //         latest_height: height::new(0, 1000),
-    //     };
+    #[test]
+    fun parse_consensus_state() {
+        let consensus_state = ConsensusState {
+            timestamp: 42,
+            app_hash: MerkleRoot {
+                hash: x"0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            next_validators_hash: x"0000000000000000000000000000000000000000000000000000000000000000"
+        };
 
-    //     let consensus_state = ConsensusState {  
-    //         timestamp: 10000,
-    //         app_hash: MerkleRoot {
-    //             hash: vector<u8>[]
-    //         },
-    //         next_validators_hash: vector<u8>[]
-    //     };
+        let cs_bytes = encode_consensus_state(&consensus_state);
+        std::debug::print(&cs_bytes);
 
-    //     assert!(create_client(ibc_signer, string::utf8(b"this_client"), std::any::pack<ClientState>(client_state), std::any::pack<ConsensusState>(consensus_state)) == 0, 1);
+        let cs = decode_consensus_state(cs_bytes);
+        std::debug::print(&cs);
+    }
 
-    //     let saved_state = borrow_global<State>(get_client_address(&string::utf8(b"this_client")));
-    //     assert!(
-    //         saved_state.client_state == client_state, 0
-    //     );
+    #[test]
+    fun decode_client_state_bcs() {
+        let encoded =
+            x"307830653735366536393666366532643634363537363665363537343264333130306330356262626138376130353030303030303762656232663732303630303030653039323635313730313030303030303030303030303030303030303030303030303030303030303030303030303031303030303030303030303030303061313263303030303030303030303030";
 
-    //     assert!(
-    //         smart_table::borrow<height::Height, ConsensusState>(&saved_state.consensus_states, client_state.latest_height) == &consensus_state, 0
-    //     );
+        let cs = decode_client_state(encoded);
+        std::debug::print(&cs);
+    }
 
-    //     client_state.trusting_period = 2;
-    //     consensus_state.timestamp = 20000;
+    #[test]
+    fun decode_consensus_state_bcs() {
+        let encoded = vector[
+            72, 31, 173, 233, 146, 25, 184, 242, 23, 80, 19, 246, 177, 68, 34, 205, 35, 75,
+            81, 37, 130, 13, 198, 171, 1, 22, 45, 1, 126, 231, 48, 211, 70, 129, 133, 154,
+            159, 121, 139, 101, 134, 47, 73, 117, 171, 126, 117, 166, 119, 244, 62, 254,
+            191, 83, 224, 236, 5, 70, 13, 44, 245, 85, 6, 173, 8, 214, 176, 82, 84, 249,
+            106, 80, 13
+        ];
 
-    //     assert!(create_client(ibc_signer, string::utf8(b"this_client-2"), std::any::pack<ClientState>(client_state), std::any::pack<ConsensusState>(consensus_state)) == 0, 1);
+        let cs = decode_consensus_state(encoded);
+        std::debug::print(&cs);
+    }
 
-    //     // new client don't mess with this client's storage
-    //     let saved_state = borrow_global<State>(get_client_address(&string::utf8(b"this_client")));
-    //     assert!(
-    //         saved_state.client_state != client_state, 0
-    //     );
+    #[test]
+    fun decode_header_bcs() {
+        let encoded =
+            x"18190000000000007074df66000000002fa8cf362f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500d2f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500daf1d4415ddfcb567803e347e72c84c6c1d82c34cce348550abbaa734055a2ae801000000000000000c19000000000000800322c7ea1ff4806e2c6f5bb451f1811d3ddf13169104b19d29d7069226265bf0d827e2684bde00a40919011d6dcaed7d532a9cbb75458529c4e70ecfad34339b01108b45a3f20303bb9fc06c7dc88fc0c7b3b7007210ddbe16c1d5e08e7a5700731156a4131427cc69d278abb3121d0a16dc2301e17714814eea0bfdcba8fcc4bd0a91ef8f43bae304a708532b9eeffee1bf45410b44b26e7b3a8be487580db2822cc971a1830bbe32ff21fa15ca968b89009097ea81af246a513226821e36072b02bb8d6be4e61fd1b97e9cf3d6ad6b778cfeadc4720ba00ef3ef302c070933ee134580bc7a30ee2c975302e1aeafb0a59500ccf066f4cdae31c1f8763409725f00d3fceab40f52a6ff8d2f3674cad1989f5035f39308abcbbf3fdd9dc127fef5203067d6849d52c80c7dea8a852980911df011b047a3ffec05990040858c03430148408f4398cba53b1820dcb87d7626a1ca0471fa142a7c1ac541fa826b13550c24643377da09dff003bcc37d79c22a72268f4b46e3e2d38f31c7c302d9b1e1";
 
-    //     assert!(
-    //         smart_table::borrow<height::Height, ConsensusState>(&saved_state.consensus_states, client_state.latest_height) != &consensus_state, 0
-    //     );
+        let cs = decode_header(encoded);
+        std::debug::print(&cs);
+    }
 
-    //     let saved_state = borrow_global<State>(get_client_address(&string::utf8(b"this_client-2")));
-    //     assert!(
-    //         saved_state.client_state == client_state, 0
-    //     );
+    // #[test]
+    // fun test_parse_zkp() {
+    //     let zkp = x"1c911d332bca4aa85d3cea5099370b8f188326d3929436d809d5532bc24165089272d9494a6d75ae2389e07d5b6bab46d5ca923cebeb5c46e4d59233afc41115da87c1b5b63aefcc64580be04db609757dafc70c18302756c45c010bb18a1a2777cebaaa757fb71ced5efa731261a4da8dc3f1755e248927ebafdcde8030171559b4af7d1e2f29028c42ece0c7a65e2a814c536138e08f701727b12139b3ed06cc4013a258a88e083562242434d2d9236bb870503c9bc4294ef989da2462b6a9";
 
-    //     assert!(
-    //         smart_table::borrow<height::Height, ConsensusState>(&saved_state.consensus_states, client_state.latest_height) == &consensus_state, 0
-    //     );
+    //     parse_zkp(zkp);
     // }
 
-    public fun new_client_state(
-        chain_id: string::String,
-        trusting_period: u64,
-        unbonding_period: u64,
-        max_clock_drift: u64,
-        frozen_height: height::Height,
-        latest_height: height::Height,
-    ): ClientState {
-        ClientState {            
-            chain_id: chain_id,
-            trusting_period: trusting_period,
-            unbonding_period: unbonding_period,
-            max_clock_drift: max_clock_drift,
-            frozen_height: frozen_height,
-            latest_height: latest_height,
-        }
-    }
-
-    public fun new_consensus_state(
-        timestamp: u64,
-        app_hash: MerkleRoot,
-        next_validators_hash: vector<u8>        
-    ): ConsensusState {
-        ConsensusState {
-            timestamp: timestamp,
-            app_hash: app_hash,
-            next_validators_hash: next_validators_hash,
-        }
-    }
-
-
-    public fun new_merkle_root(
-        hash: vector<u8>    
-    ): MerkleRoot {
-        MerkleRoot {
-            hash: hash
-        }
-    }
-
-
-    public fun get_timestamp_at_height(
-        _client_id: String,
-        _height: height::Height
-    ): u64 {
-        1
-    }
-
-    public fun get_client_state(client_id: String): vector<u8> acquires State {
-        let state = borrow_global<State>(get_client_address(&client_id));
-        encode_client_state(state.client_state)
-    }
-
-    public fun get_consensus_state(client_id: String, height: Height): vector<u8> acquires State {
-        let state = borrow_global<State>(get_client_address(&client_id));
-        let consensus_state = smart_table::borrow(&state.consensus_states, height);
-        encode_consensus_state(*consensus_state)
-    }
-
-    fun default_client_state(): ClientState {
-        ClientState {
-            chain_id: utf8(b""),
+    #[test(ibc_signer = @ibc)]
+    fun test_create_client(ibc_signer: &signer) acquires State {
+        let client_state = ClientState {
+            chain_id: string::utf8(b"this-chain"),
             trusting_period: 0,
             unbonding_period: 0,
             max_clock_drift: 0,
-            frozen_height: height::default(),
-            latest_height: height::default(),
-        }
-    }
-
-    fun decode_client_state(buf: vector<u8>): ClientState {
-        let cursor = 0;
-        let client_state = default_client_state();
-        if (vector::is_empty(&buf)) {
-            return client_state
-        };
-        while (cursor < vector::length(&buf)) {
-            let (tag, wire_type, advance, err) = proto_utils::decode_prefix(&buf, cursor);
-            assert!(err == 0, 1);
-            cursor = cursor + advance;
-            let n_read = if (tag == 1) {
-                let (str, advance) = proto_utils::decode_string(wire_type, &buf, cursor);
-                client_state.chain_id = option::extract(&mut str);
-                advance
-            } else if (tag == 2) {                
-                let (num, advance, err) = proto_utils::decode_varint(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                client_state.trusting_period = num;
-                advance
-            } else if (tag == 3) {
-                let (num, advance, err) = proto_utils::decode_varint(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                client_state.unbonding_period = num;
-                advance
-            } else if (tag == 4) {
-                let (num, advance, err) = proto_utils::decode_varint(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                client_state.max_clock_drift = num;
-                advance
-            } else if (tag == 5) {
-                let (len, advance, err) = proto_utils::decode_nested_len(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                cursor = cursor + advance;
-                let (n_read, err) = height::decode_proto(&buf, cursor, len, &mut client_state.frozen_height);
-                assert!(err == 0 && n_read == len, 1);
-                len
-            } else if (tag == 6) {
-                let (len, advance, err) = proto_utils::decode_nested_len(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                cursor = cursor + advance;
-                let (n_read, err) = height::decode_proto(&buf, cursor, len, &mut client_state.latest_height);
-                assert!(err == 0 && n_read == len, 1);
-                len
-            } else {
-                abort 1
-            };
-            cursor = cursor + n_read;
+            frozen_height: height::new(0, 0),
+            latest_height: height::new(0, 1000)
         };
 
-        client_state
-    }
-
-    fun encode_client_state(client_state: ClientState): vector<u8> {
-        let buf = vector::empty();
-
-        if (!string::is_empty(&client_state.chain_id)) {
-            vector::append(&mut buf, proto_utils::encode_string(1, client_state.chain_id));
-        };
-
-        if (client_state.trusting_period != 0) {
-            vector::append(&mut buf, proto_utils::encode_u64(2, client_state.trusting_period));
-        };
-
-        if (client_state.unbonding_period != 0) {
-            vector::append(&mut buf, proto_utils::encode_u64(3, client_state.unbonding_period));
-        };
-
-        if (client_state.max_clock_drift!= 0) {
-            vector::append(&mut buf, proto_utils::encode_u64(4, client_state.max_clock_drift));
-        };
-
-        let frozen_height = height::encode_proto(client_state.frozen_height);
-        if (!vector::is_empty(&frozen_height)) {
-            vector::append(&mut buf, proto_utils::encode_prefix(5, 2));
-            vector::append(&mut buf, proto_utils::encode_varint(vector::length(&frozen_height)));
-            vector::append(&mut buf, frozen_height);
-        };
-
-        let latest_height = height::encode_proto(client_state.latest_height);
-        if (!vector::is_empty(&latest_height)) {
-            vector::append(&mut buf, proto_utils::encode_prefix(6, 2));
-            vector::append(&mut buf, proto_utils::encode_varint(vector::length(&latest_height)));
-            vector::append(&mut buf, latest_height);
-        };
-
-        buf
-    }
-
-    fun default_consensus_state(): ConsensusState {
-        ConsensusState {
-            timestamp: 0,
+        let consensus_state = ConsensusState {
+            timestamp: 10000,
             app_hash: MerkleRoot {
-                hash: vector::empty(),
+                hash: x"0000000000000000000000000000000000000000000000000000000000000000"
             },
-            next_validators_hash: vector::empty(),
-        }
+            next_validators_hash: x"0000000000000000000000000000000000000000000000000000000000000000"
+        };
+
+        let (cs, cons) =
+            create_client(
+                ibc_signer,
+                string::utf8(b"this_client"),
+                bcs::to_bytes(&client_state),
+                encode_consensus_state(&consensus_state)
+            );
+        assert!(
+            cs == bcs::to_bytes(&client_state)
+                && cons == encode_consensus_state(&consensus_state),
+            1
+        );
+
+        let saved_state =
+            borrow_global<State>(get_client_address(&string::utf8(b"this_client")));
+        assert!(saved_state.client_state == client_state, 0);
+
+        assert!(
+            smart_table::borrow<height::Height, ConsensusState>(
+                &saved_state.consensus_states, client_state.latest_height
+            ) == &consensus_state,
+            0
+        );
+
+        client_state.trusting_period = 2;
+        consensus_state.timestamp = 20000;
+
+        let (cs, cons) =
+            create_client(
+                ibc_signer,
+                string::utf8(b"this_client-2"),
+                bcs::to_bytes(&client_state),
+                encode_consensus_state(&consensus_state)
+            );
+        assert!(
+            cs == bcs::to_bytes(&client_state)
+                && cons == encode_consensus_state(&consensus_state),
+            1
+        );
+
+        let lh = latest_height(string::utf8(b"this_client-2"));
+        std::debug::print(&lh);
+
+        // new client don't mess with this client's storage
+        let saved_state =
+            borrow_global<State>(get_client_address(&string::utf8(b"this_client")));
+        assert!(saved_state.client_state != client_state, 0);
+
+        assert!(
+            smart_table::borrow<height::Height, ConsensusState>(
+                &saved_state.consensus_states, client_state.latest_height
+            ) != &consensus_state,
+            0
+        );
+
+        let saved_state =
+            borrow_global<State>(get_client_address(&string::utf8(b"this_client-2")));
+        assert!(saved_state.client_state == client_state, 0);
+
+        assert!(
+            smart_table::borrow<height::Height, ConsensusState>(
+                &saved_state.consensus_states, client_state.latest_height
+            ) == &consensus_state,
+            0
+        );
     }
 
-    fun decode_consensus_state(buf: vector<u8>): ConsensusState {
-        let cursor = 0;
-        let consensus_state = default_consensus_state();
-        if (vector::is_empty(&buf)) {
-            return consensus_state
-        };
-        while (cursor < vector::length(&buf)) {
-            let (tag, wire_type, advance, err) = proto_utils::decode_prefix(&buf, cursor);
-            assert!(err == 0, 1);
-            cursor = cursor + advance;
-            let n_read = if (tag == 1) {
-                let (num, advance, err) = proto_utils::decode_varint(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                consensus_state.timestamp = num;
-                advance
-            } else if (tag == 2) {                
-                let (len, advance, err) = proto_utils::decode_nested_len(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                cursor = cursor + advance;
-                let n_read = decode_merkle_root(&buf, cursor, len, &mut consensus_state.app_hash);
-                assert!(n_read == len, 1);
-                len
-            } else if (tag == 3) {
-                let (bytes, advance) = proto_utils::decode_bytes(wire_type, &buf, cursor);
-                consensus_state.next_validators_hash = option::extract(&mut bytes);
-                advance
-            } else {
-                abort 1
-            };
-            
-            cursor = cursor + n_read;
-        };
+    #[test]
+    fun update_client_test() {
+        let update =
+            x"1705000000000000cfc8e2660000000078205b1f2f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500d2f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500d2bb490808b70783385f7773eee98bc942db441fa4cd2abb54f3877c6572fabe80100000000000000ff04000000000000c0016a5b345f936d30d5b2b5f981fa73e832477e4d9cbfd85a3efd513d605e12050782f65ab2e337071edb3c421c1fa17351c70f316fd9affcf057b1054098d8071fe21cedf25cb125663a97982aa13a019e4575d5e2a22c4f273cb4f05231b84aaf604a92564aee7f5a98f06f6e9096b3fdd7235e9cb141dd63ac8058a1f76cbf0c8df091911f002984cc97202e635de899a0d61306f02218ffe8ae67d737f0fe97ceb1848c6812eed77fc56f8b536b20692eeac01ac030c21d136a1072f59bfa99";
 
-        consensus_state
+        let header = decode_header(update);
+
+        std::debug::print(&header);
     }
 
-    fun encode_consensus_state(consensus_state: ConsensusState): vector<u8> {
-        let buf = vector::empty();
+    #[test]
+    fun decode_cons_state() {
+        let client =
+            x"0e756e696f6e2d6465766e65742d3100c05bbba87a050000007beb2f72060000e09265170100000000000000000000000000000000000001000000000000008605000000000000";
+        let cons =
+            x"88430614737af41719ef8a27d69c8953d2f36f7f3380a5e516752b36b66f15a1238594f019a7174e2f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500d";
+        let client = decode_client_state(client);
+        let cons = decode_consensus_state(cons);
+        let header =
+            x"9905000000000000a1cbe26600000000b660372b2f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500d2f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500dccd06a9736f4d00a1a981044332539d1affe3052dad73c836ecb178e2c0d14e501000000000000006d05000000000000c001f8aaffd288fa229cc96858d4c9675df9bdd3955e5324b2a57f1576e0099cf280f98f08e96afd770e4716b2b3425d993c9b9c60df37458aa3d7ca06de68a8e7188790db59291ef1ff610b10279f3500ff03c23b2ea6df49ca47099596ca61e91c401dbf641159608e23d272cd20f61dbb75ecdf206bd7138fb613eb1c473b60a3bcaaa29dc7bad1373277f391147481941bf9a65a4dede35fae022ba469ec6d93eda92784efb6c158cc76e32b8e5a801e189d111fac85d934d4fa7d614755a092";
+        let header = decode_header(header);
 
-        if (consensus_state.timestamp != 0) {
-            vector::append(&mut buf, proto_utils::encode_u64(1, consensus_state.timestamp));
-        };
+        std::debug::print(&cons);
+        std::debug::print(&client);
+        std::debug::print(&header);
 
-        let app_hash = encode_merkle_root(consensus_state.app_hash);
-        if (!vector::is_empty(&app_hash)) {
-            vector::append(&mut buf, proto_utils::encode_prefix(1, 2));
-            vector::append(&mut buf, proto_utils::encode_varint(vector::length(&app_hash)));
-            vector::append(&mut buf, app_hash);
-        };
+        let res =
+            groth16_verifier::verify_zkp(
+                &string::utf8(b"union-devnet-1"),
+                &cons.next_validators_hash,
+                light_header_as_input_hash(&header.signed_header),
+                &header.zero_knowledge_proof
+            );
 
-        if (!vector::is_empty(&consensus_state.next_validators_hash)) {
-            vector::append(&mut buf, proto_utils::encode_bytes(3, consensus_state.next_validators_hash));
-        };
-
-        buf
+        std::debug::print(&res);
     }
 
-    fun decode_merkle_root(buf: &vector<u8>, cursor: u64, len: u64, merkle_root: &mut MerkleRoot): u64 {
-        let first_pos = cursor;
-        while (cursor - first_pos < len) {
-            let (tag, wire_type, advance, err) = proto_utils::decode_prefix(buf, cursor);
-            assert!(err == 0, 1);
-            cursor = cursor + advance;
-            let advance = if (tag == 1) {
-                let (bytes, advance) = proto_utils::decode_bytes(wire_type, buf, cursor);
-                merkle_root.hash = option::extract(&mut bytes);
-                advance
-            } else {
-                abort 1
-            };
-            cursor = cursor + advance;
-        };
+    #[test]
+    fun see_update() {
+        let update =
+            x"e101000000000000ab5ded6600000000717e872e2f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500d2f4975ab7e75a677f43efebf53e0ec05460d2cf55506ad08d6b05254f96a500d087872d0ad8da9d06cd7b97611bea8ca42741eb9440dbf823cdea268ecf4a3bc0100000000000000a800000000000000800306327cd8c426a4cba21185a8ff6c3c22432721cfa61499c65725bc9a1b4ca3eb1e47f9109ebc99820a989b324b2961613b9ad2c5f9362da38116b55b98cd170b141370751c54ba39bfedfacf83ca9182592c5ca9e24b273cfca5301c9ddebb66043822c12d446cf9d9ad288b593242c50796040fcba95ae1af1724d42be7662f0558864213a4e938f1a26cd889b4466f7b8dfc6ed2f0545ac4f067f77e0a81761263311f8bcdbecf6d0f1cea52011dd1182a36d16de8aabe9ee1664834273c56235b2195ebf4f9ba72347b9fab04734d762e7ba2529c8330b2c26dd47d8f90ef0348b6b26ab3ec6de09327616b78c3e1e3da91b379254f26d06513bad4bafbc0295369bae4c078b7c7b47a2e61267af50a318bac36d82a86d129ce5f8f27956f218903e09626a5a32c96b7ce51bc05b7c5f21278e4aaa566519aa4c71a2b601e11c718e76a7bf579d5a216e8426943b5232c1159280fa8e5210a5b3df23d25c91308e01c7c1e0f5c778fb6cfef463730f888df7cc26ab5950b067771930d9dea";
 
-        // nullable = false
-        if (vector::is_empty(&merkle_root.hash)) {
-            abort 1
-        };
-
-        cursor - first_pos
-    }
-
-    public fun encode_merkle_root(merkle_root: MerkleRoot): vector<u8> {
-        let buf = vector::empty();
-
-        // nullable = false
-        vector::append(&mut buf, proto_utils::encode_bytes(1, merkle_root.hash));
-
-        buf
-    }
-
-    public fun default_zkp(): ZKP {
-        ZKP {
-            proof: Proof {
-                a: zero<G1>(),
-                b: zero<G2>(),
-                c: zero<G1>(),
-            },
-            proof_commitment: zero<G1>(),
-            proof_commitment_pok: zero<G1>(),
-        }
-    }
-
-    public fun default_header(): Header {
-        Header {
-            signed_header: default_light_header(),
-            trusted_height: height::default(),
-            zero_knowledge_proof: default_zkp(),
-        }
-    }
-
-    fun decode_header(buf: vector<u8>): Header {
-        let cursor = 0;
-        let header = default_header();
-        if (vector::is_empty(&buf)) {
-            return header
-        };
-        while (cursor < vector::length(&buf)) {
-            let (tag, wire_type, advance, err) = proto_utils::decode_prefix(&buf, cursor);
-            assert!(err == 0, 1);
-            cursor = cursor + advance;
-            let n_read = if (tag == 1) {
-                let (len, advance, err) = proto_utils::decode_nested_len(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                cursor = cursor + advance;
-                let n_read = decode_light_header(&buf, cursor, len, &mut header.signed_header);
-                assert!(n_read == len, 1);
-                len
-            } else if (tag == 2) {                
-                let (len, advance, err) = proto_utils::decode_nested_len(wire_type, &buf, cursor);
-                assert!(err == 0, 1);
-                cursor = cursor + advance;
-                let (n_read, err) = height::decode_proto(&buf, cursor, len, &mut header.trusted_height);
-                assert!(err == 0 && n_read == len, 1);
-                len
-            } else if (tag == 3) {
-                let (bytes, advance) = proto_utils::decode_bytes(wire_type, &buf, cursor);
-                let _zkp = option::extract(&mut bytes);
-                // TODO(aeryz): parse zkp here
-                advance
-            } else {
-                abort 1
-            };
-            
-            cursor = cursor + n_read;
-        };
-
-        header
-    }
-
-
-    public fun default_light_header(): LightHeader {
-        LightHeader {
-            height: 0,
-            time: Timestamp {
-                nanos: 0,
-                seconds: 0,
-            },
-            validators_hash: vector::empty(),
-            next_validators_hash: vector::empty(),
-            app_hash: vector::empty(),
-        }
-    }
-
-    public fun encode_light_header(header: LightHeader): vector<u8> {
-        let buf = vector::empty();
-
-        if (header.height != 0) {
-            vector::append(&mut buf, proto_utils::encode_u64(1, header.height));
-        };
-
-        let time = encode_timestamp(header.time);
-        if (!vector::is_empty(&time)) {
-            vector::append(&mut buf, proto_utils::encode_prefix(1, 2));
-            vector::append(&mut buf, proto_utils::encode_varint(vector::length(&time)));
-            vector::append(&mut buf, time);
-        };
-
-        if (!vector::is_empty(&header.validators_hash)) {
-            vector::append(&mut buf, proto_utils::encode_bytes(3, header.validators_hash));
-        };
-
-        if (!vector::is_empty(&header.next_validators_hash)) {
-            vector::append(&mut buf, proto_utils::encode_bytes(4, header.next_validators_hash));
-        };
-
-        if (!vector::is_empty(&header.app_hash)) {
-            vector::append(&mut buf, proto_utils::encode_bytes(5, header.app_hash));
-        };
-
-        buf
-    }
-    
-    public fun decode_light_header(buf: &vector<u8>, cursor: u64, len: u64, light_header: &mut LightHeader): u64 {
-        let first_pos = cursor;
-        while (cursor - first_pos < len) {
-            let (tag, wire_type, advance, err) = proto_utils::decode_prefix(buf, cursor);
-            assert!(err == 0, 1);
-            cursor = cursor + advance;
-            let advance = if (tag == 1) {
-                let (num, advance, err) = proto_utils::decode_varint(wire_type, buf, cursor);
-                assert!(err == 0, 1);
-                light_header.height = num;
-                advance
-            } else if (tag == 2) {
-                let (len, advance, err) = proto_utils::decode_nested_len(wire_type, buf, cursor);
-                assert!(err == 0, 1);
-                cursor = cursor + advance;
-                let n_read = decode_timestamp(buf, cursor, len, &mut light_header.time);
-                assert!(n_read == len, 1);
-                len
-            } else if (tag == 3) {
-                let (bytes, advance) = proto_utils::decode_bytes(wire_type, buf, cursor);
-                light_header.validators_hash = option::extract(&mut bytes);
-                advance
-            } else if (tag == 4) {
-                let (bytes, advance) = proto_utils::decode_bytes(wire_type, buf, cursor);
-                light_header.validators_hash = option::extract(&mut bytes);
-                advance
-            } else if (tag == 5) {
-                let (bytes, advance) = proto_utils::decode_bytes(wire_type, buf, cursor);
-                light_header.validators_hash = option::extract(&mut bytes);
-                advance
-            }
-            
-            else {
-                abort 1
-            };
-            cursor = cursor + advance;
-        };
-
-        cursor - first_pos
-    }
-
-    public fun encode_timestamp(timestamp: Timestamp): vector<u8> {
-        let buf = vector::empty();
-
-        if (timestamp.seconds != 0) {
-            vector::append(&mut buf, proto_utils::encode_u64(1, timestamp.seconds));
-        };
-
-        if (timestamp.nanos != 0) {
-            vector::append(&mut buf, proto_utils::encode_u32(2, timestamp.nanos));
-        };
-
-        buf
-    }
-
-    fun decode_timestamp(buf: &vector<u8>, cursor: u64, len: u64, timestamp: &mut Timestamp): u64 {
-        let first_pos = cursor;
-        while (cursor - first_pos < len) {
-            let (tag, wire_type, advance, err) = proto_utils::decode_prefix(buf, cursor);
-            assert!(err == 0, 1);
-            cursor = cursor + advance;
-            let advance = if (tag == 1) {
-                let (num, advance, err) = proto_utils::decode_varint(wire_type, buf, cursor);
-                assert!(err == 0, 1);
-                timestamp.seconds = num;
-                advance
-            } else if (tag == 2) {
-                let (num, advance, err) = proto_utils::decode_varint(wire_type, buf, cursor);
-                assert!(err == 0, 1);
-                timestamp.nanos = (num as u32);
-                advance
-            } else {
-                abort 1
-            };
-            cursor = cursor + advance;
-        };
-
-        cursor - first_pos
+        let header = decode_header(update);
     }
 }

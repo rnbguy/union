@@ -2,9 +2,8 @@ use core::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// The empty/ "bottom" type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Never {}
 
 impl Display for Never {
@@ -13,4 +12,4 @@ impl Display for Never {
     }
 }
 
-impl std::error::Error for Never {}
+impl core::error::Error for Never {}

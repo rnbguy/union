@@ -11,6 +11,7 @@
   "caseSensitive": false,
   "dictionaries": ["en_US", "companies", "softwareTerms", "go", "union"],
   "ignorePaths": [
+    "ceremony/src/lib/constants/*",
     "**/*.splinecode",
     "**/*.graphql",
     "light-clients/ethereum-light-client/src/test/**",
@@ -39,8 +40,10 @@
     "networks/genesis/union-testnet-7/**",
     "networks/genesis/union-testnet-8/**",
     "site/public/genesis.json",
+    "docs/public/genesis.json",
     "hubble/hasura/**",
     "site/src/lib/abi/**",
+    "docs/src/lib/abi/**",
     "typescript-sdk/scripts/**",
     "e2e/upgrades.nix",
     "yarn.lock",
@@ -51,6 +54,8 @@
     "app/scripts/_index.ts",
     "lib/pg-queue/migrations",
     "./site/src/content/openapi/**",
-    "uniond/docs/static/openapi.yml"
+    "./docs/src/content/openapi/**",
+    "uniond/docs/static/openapi.yml",
+    "docs/src/assets/theme/**"
   ]
 }

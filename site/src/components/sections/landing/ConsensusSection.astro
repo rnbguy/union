@@ -1,0 +1,35 @@
+---
+import H1 from "../../typography/h1.astro"
+import ButtonA from "../../ButtonA.astro"
+import QuoteSubTitle from "../../typography/QuoteSubTitle.astro"
+import ContainedSection from "../../ContainedSection.astro"
+import { renderRichText, renderTitle } from "../../../lib/contentful/render.ts"
+
+interface Props {
+  title: any
+  text: any
+}
+
+const { title, text } = Astro.props
+
+const titleHtml = renderTitle(title)
+const textHtml = renderRichText(text)
+---
+
+<ContainedSection>
+  <div class="flex flex-col-reverse md:flex-row lg:gap-12">
+    <div class="flex flex-col justify-center gap-4 flex-1">
+      <H1>
+        <Fragment set:html={titleHtml}/>
+      </H1>
+      <div class="max-w-[438px]">
+        <QuoteSubTitle>
+          <Fragment set:html={textHtml}/>
+        </QuoteSubTitle>
+      </div>
+      <ButtonA>Learn More</ButtonA>
+    </div>
+    <video class="bg-black flex-1 flex items-center" src="https://pub-32dd1494f0fa423cb1013941269ecce9.r2.dev/radial-glass-v8.mp4"
+           autoplay muted loop/>
+  </div>
+</ContainedSection>

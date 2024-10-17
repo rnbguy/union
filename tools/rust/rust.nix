@@ -1,8 +1,16 @@
-{ ... }: {
-  perSystem = { pkgs, system, dbg, ensureAtRepositoryRoot, mkCi, ... }:
+_: {
+  perSystem =
+    {
+      pkgs,
+      system,
+      dbg,
+      ensureAtRepositoryRoot,
+      mkCi,
+      ...
+    }:
     let
-      # https://releases.rs/docs/1.80.0/
-      nightlyVersion = "2024-06-07";
+      # https://rust-lang.github.io/rustup-components-history/
+      nightlyVersion = "2024-09-17";
       defaultChannel = "nightly-${nightlyVersion}";
 
       # # hopefully if we ever use wasi this issue will be resolved: https://github.com/NixOS/nixpkgs/pull/146274
@@ -21,32 +29,37 @@
         llvm-tools-preview = "llvm-tools-preview";
       };
 
+      # rustSrc =
+      #   let
+      #     content = pkgs.rust-bin.nightly.${nightlyVersion}._manifest.pkg.rust-src.target."*";
+      #     # copied from https://github.com/oxalica/rust-overlay/blob/44210df7a70dcf0a81a5919f9422b6ae589ee673/rust-overlay.nix#L123C36-L123C36
+      #     mkComponentSrc = { url, sha256 }:
+      #       let
+      #         url' = pkgs.lib.replaceStrings [ " " ] [ "%20" ] url; # This is required or download will fail.
+      #         # Filter names like `llvm-tools-1.34.2 (6c2484dc3 2019-05-13)-aarch64-unknown-linux-gnu.tar.xz`
+      #         matchParenPart = builtins.match ".*/([^ /]*) [(][^)]*[)](.*)" url;
+      #         name = if matchParenPart == null then "" else (pkgs.lib.elemAt matchParenPart 0) + (pkgs.lib.elemAt matchParenPart 1);
+      #       in
+      #       builtins.fetchurl {
+      #         inherit name sha256;
+      #         url = url';
+      #       };
+      #   in
+      #   dbg (mkComponentSrc {
+      #     url = content.xz_url;
+      #     sha256 = content.xz_hash;
+      #   });
+
       rustSrc =
-        let
-          content = pkgs.rust-bin.nightly.${nightlyVersion}._manifest.pkg.rust-src.target."*";
-          # copied from https://github.com/oxalica/rust-overlay/blob/44210df7a70dcf0a81a5919f9422b6ae589ee673/rust-overlay.nix#L123C36-L123C36
-          mkComponentSrc = { url, sha256 }:
-            let
-              url' = pkgs.lib.replaceStrings [ " " ] [ "%20" ] url; # This is required or download will fail.
-              # Filter names like `llvm-tools-1.34.2 (6c2484dc3 2019-05-13)-aarch64-unknown-linux-gnu.tar.xz`
-              matchParenPart = builtins.match ".*/([^ /]*) [(][^)]*[)](.*)" url;
-              name = if matchParenPart == null then "" else (pkgs.lib.elemAt matchParenPart 0) + (pkgs.lib.elemAt matchParenPart 1);
-            in
-            builtins.fetchurl {
-              inherit name sha256;
-              url = url';
-            };
-        in
-        mkComponentSrc {
-          url = content.xz_url;
-          sha256 = content.xz_hash;
-        };
+        (dbg (mkToolchain {
+          components = [ availableComponents.rust-src ];
+        })).passthru.availableComponents.rust-src;
 
       mkToolchain =
-        { targets ? [ ]
-        , components ? [ ]
-        , channel ? defaultChannel
-        ,
+        {
+          targets ? [ ],
+          components ? [ ],
+          channel ? defaultChannel,
         }:
         pkgs.rust-bin.fromRustupToolchain {
           inherit channel targets;
@@ -55,51 +68,57 @@
           #
           # it should be possible to construct the toolchains manually, but this works for now
           profile = "minimal";
-          components = pkgs.lib.checkListOfEnum
-            "rustup components"
-            (builtins.attrValues availableComponents)
-            components
-            components;
+          components =
+            pkgs.lib.checkListOfEnum "rustup components" (builtins.attrValues availableComponents) components
+              components;
         };
 
       mkBuildStdToolchain =
-        { targets ? [ ]
-        , channel ? defaultChannel
+        {
+          targets ? [ ],
+          channel ? defaultChannel,
         }:
         mkToolchain {
           inherit targets;
-          components = with availableComponents; [ rustc cargo rust-src ];
+          components = with availableComponents; [
+            rustc
+            cargo
+            rust-src
+          ];
         };
 
       mkNightly =
-        { targets ? [ ]
-        , channel ? defaultChannel
+        {
+          targets ? [ ],
+          channel ? defaultChannel,
         }:
         mkToolchain {
           inherit targets channel;
-          components = with availableComponents; [ rustc cargo rust-std clippy ];
+          components = with availableComponents; [
+            rustc
+            cargo
+            rust-std
+            clippy
+          ];
         };
     in
     rec {
       packages.rust-home = _module.args.rust.toolchains.dev;
 
-      packages.fetchRustStdCargoLock = mkCi false (pkgs.writeShellApplication {
-        name = "fetchRustStdCargoLock";
-        runtimeInputs = [ pkgs.xz ];
-        text = ''
-          ${ensureAtRepositoryRoot}
+      packages.fetchRustStdCargoLock = mkCi false (
+        pkgs.writeShellApplication {
+          name = "fetchRustStdCargoLock";
+          runtimeInputs = [ pkgs.xz ];
+          text = ''
+            ${ensureAtRepositoryRoot}
 
-          output=$(mktemp -d)
+            # echo ${rustSrc}
+            # ls -al ${rustSrc}
 
-          echo "$output"
-
-          tar -xf ${rustSrc} -C "$output"
-
-          ls -al "$output"
-
-          cp "$output"/rust-src-nightly/rust-src/lib/rustlib/src/rust/Cargo.lock tools/rust/rust-std-Cargo.lock
-        '';
-      });
+            cp ${rustSrc}/lib/rustlib/src/rust/library/Cargo.lock tools/rust/rust-std-Cargo.lock
+          '';
+        }
+      );
 
       _module.args.rust = {
         inherit mkBuildStdToolchain mkNightly rustSrc;
@@ -108,10 +127,10 @@
           nightly = mkNightly { };
 
           # for use in the devShell
-          dev = (pkgs.rust-bin.nightly.${nightlyVersion}.default.override {
+          dev = pkgs.rust-bin.nightly.${nightlyVersion}.default.override {
             extensions = builtins.attrValues availableComponents;
             targets = [ "wasm32-unknown-unknown" ];
-          });
+          };
         };
       };
     };

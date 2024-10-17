@@ -57,6 +57,7 @@ impl HalfNode {
     }
 }
 
+#[allow(clippy::too_long_first_doc_paragraph)]
 /// Provides a Merkle-root hasher that allows for streaming bytes (i.e., providing any-length byte
 /// slices without need to separate into leaves). Efficiently handles cases where not all leaves
 /// have been provided by assuming all non-provided leaves are `[0; 32]` and pre-computing the
@@ -121,7 +122,6 @@ impl HalfNode {
 ///        / \ / \
 ///       L  L L  L
 /// ```
-///
 pub struct MerkleHasher {
     /// Stores the nodes that are half-complete and awaiting a right node.
     ///

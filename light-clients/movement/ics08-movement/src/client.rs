@@ -1,4 +1,4 @@
-use cosmwasm_std::{Deps, Empty};
+use cosmwasm_std::Deps;
 use ics008_wasm_client::{
     storage_utils::{
         read_client_state, read_consensus_state, save_client_state, save_consensus_state,
@@ -6,36 +6,39 @@ use ics008_wasm_client::{
     IbcClient, IbcClientError, StorageState,
 };
 use unionlabs::{
-    aptos::{account::AccountAddress, hash_value::HashValue, transaction_info::TransactionInfo},
-    cosmwasm::wasm::union::custom_query::{query_consensus_state, UnionCustomQuery},
-    encoding::Proto,
-    hash::{H160, H256},
+    aptos::{
+        account::AccountAddress, storage_proof::StorageProof, transaction_info::TransactionInfo,
+    },
+    cosmwasm::wasm::union::custom_query::UnionCustomQuery,
+    encoding::{Bcs, DecodeAs, EncodeAs as _, Proto},
+    google::protobuf::any::Any,
+    hash::H256,
     ibc::{
         core::{client::height::Height, commitment::merkle_path::MerklePath},
         lightclients::{
-            ethereum,
+            cometbls,
             movement::{
                 client_state::ClientState, consensus_state::ConsensusState, header::Header,
             },
             wasm,
         },
     },
-    uint::U256,
+    ics24::Path,
 };
 
 use crate::errors::Error;
 
 type WasmClientState = wasm::client_state::ClientState<ClientState>;
 type WasmConsensusState = wasm::consensus_state::ConsensusState<ConsensusState>;
-type WasmL1ConsensusState =
-    wasm::consensus_state::ConsensusState<ethereum::consensus_state::ConsensusState>;
+// type WasmL1ConsensusState =
+//     wasm::consensus_state::ConsensusState<ethereum::consensus_state::ConsensusState>;
 
-#[derive(rlp::RlpEncodable)]
-struct BlockCommitment {
-    pub height: U256,
-    pub commitment: U256,
-    pub block_id: U256,
-}
+// #[derive(rlp::RlpEncodable)]
+// struct BlockCommitment {
+//     pub height: U256,
+//     pub commitment: U256,
+//     pub block_id: U256,
+// }
 
 pub struct MovementLightClient;
 
@@ -63,22 +66,26 @@ impl IbcClient for MovementLightClient {
         mut path: MerklePath,
         value: StorageState,
     ) -> Result<(), IbcClientError<Self>> {
-        let consensus_state: WasmConsensusState =
-            read_consensus_state(deps, &height)?.ok_or(Error::ConsensusStateNotFound(height))?;
-        let client_state: WasmClientState = read_client_state(deps)?;
+        #[cfg(feature = "union-movement")]
+        {
+            let consensus_state: WasmConsensusState = read_consensus_state(deps, &height)?
+                .ok_or(Error::ConsensusStateNotFound(height))?;
+            let client_state: WasmClientState = read_client_state(deps)?;
 
-        let path = path.key_path.pop().ok_or(Error::EmptyIbcPath)?;
+            let path = path.key_path.pop().ok_or(Error::EmptyIbcPath)?;
 
-        match value {
-            StorageState::Occupied(value) => do_verify_membership(
-                path,
-                consensus_state.data.state_root,
-                client_state.data.table_handle,
-                proof,
-                value,
-            ),
-            StorageState::Empty => unimplemented!(),
+            match value {
+                StorageState::Occupied(value) => do_verify_membership(
+                    path,
+                    consensus_state.data.state_root,
+                    client_state.data.table_handle,
+                    proof,
+                    value,
+                )?,
+                StorageState::Empty => unimplemented!(),
+            }
         }
+        Ok(())
     }
 
     fn verify_header(
@@ -86,51 +93,62 @@ impl IbcClient for MovementLightClient {
         env: cosmwasm_std::Env,
         header: Header,
     ) -> Result<(), IbcClientError<Self>> {
-        let client_state: WasmClientState = read_client_state(deps)?;
+        // NOTE(aeryz): FOR AUDITORS and NERDS:
+        // Movement's current REST API's don't provide state and transaction proofs. We added those to our custom
+        // Movement node which we also work on getting them to be upstreamed. Hence, we use the following feature-flag with
+        // a custom setup.
+        // Also see the related PR: https://github.com/movementlabsxyz/movement/pull/645
 
-        let l1_consensus_state = query_consensus_state::<WasmL1ConsensusState>(
-            deps,
-            &env,
-            client_state.data.l1_client_id.to_string(),
-            header.l1_height,
-        )
-        .map_err(Error::CustomQuery)?;
+        #[cfg(feature = "union-movement")]
+        {
+            aptos_verifier::verify_tx_state(
+                &header.tx_proof,
+                *header
+                    .state_proof
+                    .latest_ledger_info()
+                    .commit_info
+                    .executed_state_id
+                    .get(),
+                header.tx_index,
+            )
+            .map_err(Into::<Error>::into)?;
 
-        aptos_verifier::verify_tx_state(
-            &header.tx_proof,
-            header
-                .state_proof
-                .latest_ledger_info()
-                .commit_info
-                .executed_state_id,
-            header.state_proof.latest_ledger_info().commit_info.version,
-        )
-        .map_err(Into::<Error>::into)?;
+            // TODO(aeryz): make sure the given state_proof_hash_proof.key matches the correct slot
 
-        let expected_commitment = BlockCommitment {
-            height: header.new_height.into(),
-            commitment: U256::from_be_bytes(header.state_proof.hash()),
-            block_id: U256::from_be_bytes(header.state_proof.latest_ledger_info().commit_info.id.0),
-        };
+            let client_state: WasmClientState = read_client_state(deps)?;
 
-        // TODO(aeryz): make sure the given state_proof_hash_proof.key matches the correct slot
+            let l1_consensus_state = query_consensus_state::<WasmL1ConsensusState>(
+                deps,
+                &env,
+                client_state.data.l1_client_id.to_string(),
+                header.l1_height,
+            )
+            .map_err(Error::CustomQuery)?;
 
-        ethereum_verifier::verify::verify_account_storage_root(
-            l1_consensus_state.data.state_root,
-            &client_state.data.l1_contract_address,
-            &header.settlement_contract_proof.proof,
-            &header.settlement_contract_proof.storage_root,
-        )
-        .unwrap();
+            let expected_commitment = BlockCommitment {
+                height: header.new_height.into(),
+                commitment: U256::from_be_bytes(header.state_proof.hash()),
+                block_id: U256::from_be_bytes(
+                    header.state_proof.latest_ledger_info().commit_info.id.0,
+                ),
+            };
 
-        ethereum_verifier::verify::verify_storage_proof(
-            header.settlement_contract_proof.storage_root,
-            header.state_proof_hash_proof.key,
-            &rlp::encode(&expected_commitment),
-            header.state_proof_hash_proof.proof,
-        )
-        .unwrap();
+            ethereum_verifier::verify::verify_account_storage_root(
+                l1_consensus_state.data.state_root,
+                &client_state.data.l1_contract_address,
+                &header.settlement_contract_proof.proof,
+                &header.settlement_contract_proof.storage_root,
+            )
+            .unwrap();
 
+            ethereum_verifier::verify::verify_storage_proof(
+                header.settlement_contract_proof.storage_root,
+                header.state_proof_hash_proof.key,
+                &rlp::encode(&expected_commitment),
+                header.state_proof_hash_proof.proof,
+            )
+            .unwrap();
+        }
         Ok(())
     }
 
@@ -152,7 +170,7 @@ impl IbcClient for MovementLightClient {
         let TransactionInfo::V0(tx_info) = header.tx_proof.transaction_info;
 
         let consensus_state = ConsensusState {
-            state_root: tx_info.state_checkpoint_hash.unwrap(), // TODO(aeryz): we always need this, no need to make this an option
+            state_root: H256::new(*tx_info.state_checkpoint_hash.unwrap().get()), // TODO(aeryz): we always need this, no need to make this not an option
             timestamp: header
                 .state_proof
                 .latest_ledger_info()
@@ -225,7 +243,7 @@ impl IbcClient for MovementLightClient {
         _deps: Deps<Self::CustomQuery>,
         _env: &cosmwasm_std::Env,
     ) -> Result<ics008_wasm_client::Status, IbcClientError<Self>> {
-        todo!()
+        Ok(ics008_wasm_client::Status::Active)
     }
 
     fn export_metadata(
@@ -239,27 +257,118 @@ impl IbcClient for MovementLightClient {
     }
 
     fn timestamp_at_height(
-        _deps: Deps<Self::CustomQuery>,
-        _height: Height,
+        deps: Deps<Self::CustomQuery>,
+        height: Height,
     ) -> Result<u64, IbcClientError<Self>> {
-        todo!()
+        Ok(read_consensus_state::<Self>(deps, &height)?
+            .ok_or(Error::ConsensusStateNotFound(height))?
+            .data
+            .timestamp)
     }
 }
 
 fn do_verify_membership(
-    _path: String,
-    state_root: HashValue,
-    _table_handle: AccountAddress,
+    path: String,
+    state_root: H256,
+    table_handle: AccountAddress,
     proof: Vec<u8>,
     value: Vec<u8>,
 ) -> Result<(), IbcClientError<MovementLightClient>> {
-    aptos_verifier::verify_existence_proof(
-        &proof,
-        state_root,
-        HashValue::default(),
-        value.try_into().unwrap(),
-    )
-    .unwrap();
+    let proof = StorageProof::decode_as::<Proto>(&proof).map_err(Error::StorageProofDecode)?;
 
-    Ok(())
+    let value = match path
+        .parse::<Path>()
+        .map_err(|_| Error::InvalidIbcPath(path.clone()))?
+    {
+        // proto(any<cometbls>) -> bcs(cometbls)
+        Path::ClientState(_) => {
+            Any::<cometbls::client_state::ClientState>::decode_as::<Proto>(&value)
+                .map_err(Error::CometblsClientStateDecode)?
+                .0
+                .encode_as::<Bcs>()
+        }
+        // proto(any<wasm<cometbls>>) -> bcs(cometbls)
+        Path::ClientConsensusState(_) => Any::<
+            wasm::consensus_state::ConsensusState<cometbls::consensus_state::ConsensusState>,
+        >::decode_as::<Proto>(&value)
+        .map_err(Error::CometblsConsensusStateDecode)?
+        .0
+        .data
+        .encode_as::<Bcs>(),
+        _ => value,
+    };
+
+    let Some(proof_value) = &proof.state_value else {
+        return Err(Error::MembershipProofWithoutValue.into());
+    };
+
+    // `aptos_std::table` stores the value as bcs encoded
+    let given_value = bcs::to_bytes(&value).expect("cannot fail");
+    if proof_value.data() != &given_value {
+        return Err(Error::ProofValueMismatch(proof_value.data().to_vec(), given_value).into());
+    }
+
+    let Some(proof_leaf) = proof.proof.leaf.as_ref() else {
+        return Err(Error::MembershipProofWithoutValue.into());
+    };
+
+    if aptos_verifier::hash_state_value(proof_value) != *proof_leaf.value_hash.get() {
+        return Err(Error::ProofValueHashMismatch.into());
+    }
+
+    let key = aptos_verifier::hash_table_key(
+        &bcs::to_bytes(path.as_bytes()).expect("cannot fail"),
+        &table_handle,
+    );
+
+    if key != *proof_leaf.key.get() {
+        return Err(Error::ProofKeyMismatch.into());
+    }
+
+    Ok(
+        aptos_verifier::verify_membership(proof.proof, state_root.into())
+            .map_err(Into::<Error>::into)?,
+    )
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename = "StateValue")]
+enum PersistedStateValue {
+    V0(Vec<u8>),
+    WithMetadata {
+        data: Vec<u8>,
+        metadata: PersistedStateValueMetadata,
+    },
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename = "StateValueMetadata")]
+pub enum PersistedStateValueMetadata {
+    V0 {
+        deposit: u64,
+        creation_time_usecs: u64,
+    },
+    V1 {
+        slot_deposit: u64,
+        bytes_deposit: u64,
+        creation_time_usecs: u64,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use hex_literal::hex;
+    use unionlabs::{
+        encoding::{DecodeAs, Proto},
+        ibc::core::channel::channel::Channel,
+    };
+
+    #[test]
+    fn test_proto() {
+        let channel_end = hex!("6d080110011a470a457761736d2e756e696f6e3134686a32746176713866706573647778786375343472747933686839307668756a7276636d73746c347a723374786d6676773973336539666532220c636f6e6e656374696f6e2d302a1075637330302d70696e67706f6e672d31");
+        println!(
+            "end 1: {:?}",
+            Channel::decode_as::<Proto>(&channel_end).unwrap()
+        );
+    }
 }

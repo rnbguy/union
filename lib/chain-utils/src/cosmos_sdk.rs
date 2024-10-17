@@ -18,11 +18,10 @@ use unionlabs::{
     },
     encoding::{EncodeAs, Proto},
     google::protobuf::any::Any,
-    hash::H256,
-    id::ConnectionId,
+    hash::{hash_v2::HexUnprefixed, H256},
+    id::{ClientId, ConnectionId},
     parse_wasm_client_type,
     signer::CosmosSigner,
-    traits::Chain,
     ErrorReporter, MaybeRecoverableError, WasmClientType,
 };
 
@@ -49,10 +48,10 @@ pub struct GasConfig {
 impl GasConfig {
     pub fn mk_fee(&self, gas: u64) -> Fee {
         // gas limit = provided gas * multiplier, clamped between min_gas and max_gas
-        let gas_limit = u128_mul_f64(gas.into(), self.gas_multiplier)
+        let gas_limit = u128_saturating_mul_f64(gas.into(), self.gas_multiplier)
             .clamp(self.min_gas.into(), self.max_gas.into());
 
-        let amount = u128_mul_f64(gas.into(), self.gas_price);
+        let amount = u128_saturating_mul_f64(gas.into(), self.gas_price);
 
         Fee {
             amount: vec![Coin {
@@ -79,13 +78,11 @@ pub trait CosmosSdkChain {
 }
 
 #[allow(async_fn_in_trait)]
-pub trait CosmosSdkChainIbcExt:
-    CosmosSdkChain + CosmosSdkChainRpcs + Chain<Error = tendermint_rpc::Error>
-{
+pub trait CosmosSdkChainIbcExt: CosmosSdkChain + CosmosSdkChainRpcs {
     async fn client_type_of_checksum(&self, checksum: H256) -> Option<WasmClientType> {
         if let Some(ty) = self.checksum_cache().get(&checksum) {
             debug!(
-                checksum = %checksum.to_string_unprefixed(),
+                %checksum,
                 ty = ?*ty,
                 "cache hit for checksum"
             );
@@ -94,7 +91,7 @@ pub trait CosmosSdkChainIbcExt:
         };
 
         info!(
-            checksum = %checksum.to_string_unprefixed(),
+            %checksum,
             "cache miss for checksum"
         );
 
@@ -104,7 +101,7 @@ pub trait CosmosSdkChainIbcExt:
         .await
         .unwrap()
         .code(protos::ibc::lightclients::wasm::v1::QueryCodeRequest {
-            checksum: checksum.to_string_unprefixed(),
+            checksum: checksum.into_encoding::<HexUnprefixed>().to_string(),
         })
         .await
         .unwrap()
@@ -114,7 +111,7 @@ pub trait CosmosSdkChainIbcExt:
         match parse_wasm_client_type(bz) {
             Ok(Some(ty)) => {
                 info!(
-                    checksum = %checksum.to_string_unprefixed(),
+                    %checksum,
                     ?ty,
                     "parsed checksum"
                 );
@@ -126,7 +123,7 @@ pub trait CosmosSdkChainIbcExt:
             Ok(None) => None,
             Err(err) => {
                 error!(
-                    checksum = %checksum.to_string_unprefixed(),
+                    %checksum,
                     %err,
                     "unable to parse wasm client type"
                 );
@@ -136,7 +133,7 @@ pub trait CosmosSdkChainIbcExt:
         }
     }
 
-    async fn checksum_of_client_id(&self, client_id: Self::ClientId) -> H256 {
+    async fn checksum_of_client_id(&self, client_id: ClientId) -> H256 {
         let client_state = protos::ibc::core::client::v1::query_client::QueryClient::connect(
             self.grpc_url().clone(),
         )
@@ -163,7 +160,7 @@ pub trait CosmosSdkChainIbcExt:
             .unwrap()
     }
 
-    async fn client_id_of_connection(&self, connection_id: ConnectionId) -> Self::ClientId {
+    async fn client_id_of_connection(&self, connection_id: ConnectionId) -> ClientId {
         protos::ibc::core::connection::v1::query_client::QueryClient::connect(
             self.grpc_url().clone(),
         )
@@ -372,7 +369,8 @@ pub trait CosmosSdkChainExt: CosmosSdkChainRpcs {
             .unwrap();
 
         let tx_body = TxBody {
-            messages: messages.clone().into_iter().collect(),
+            // TODO: Use RawAny in the signature of this function and broadcast_tx_commit
+            messages: messages.clone().into_iter().map(Into::into).collect(),
             memo,
             timeout_height: 0,
             extension_options: vec![],
@@ -493,25 +491,23 @@ pub async fn fetch_balances(
     out_vec
 }
 
-fn u128_mul_f64(u: u128, f: f64) -> u128 {
+fn u128_saturating_mul_f64(u: u128, f: f64) -> u128 {
     (num_rational::BigRational::from_integer(u.into())
         * num_rational::BigRational::from_float(f).expect("finite"))
     .to_integer()
     .try_into()
-    .expect("overflow")
+    .unwrap_or(u128::MAX)
+    // .expect("overflow")
 }
 
 #[test]
 fn test_u128_mul_f64() {
-    let val = u128_mul_f64(100, 1.1);
+    let val = u128_saturating_mul_f64(100, 1.1);
 
     assert_eq!(val, 110);
 }
 
-impl<T: CosmosSdkChain + CosmosSdkChainRpcs + Chain<Error = tendermint_rpc::Error>>
-    CosmosSdkChainIbcExt for T
-{
-}
+impl<T: CosmosSdkChain + CosmosSdkChainRpcs> CosmosSdkChainIbcExt for T {}
 
 impl<T: CosmosSdkChainRpcs> CosmosSdkChainExt for T {}
 
@@ -868,6 +864,77 @@ pub mod cosmos_sdk_error {
             ErrInvalidChannelVersion = errorsmod.Register(SubModuleName, 24, "invalid channel version")
             ErrPacketNotSent         = errorsmod.Register(SubModuleName, 25, "packet has not been sent")
             ErrInvalidTimeout        = errorsmod.Register(SubModuleName, 26, "invalid packet timeout")
+        )
+
+        // https://github.com/cosmos/ibc-go/blob/main/modules/light-clients/08-wasm/types/errors.go
+        #[err(name = IbcWasmError, codespace = "08-wasm")]
+        var (
+            ErrInvalid              = errorsmod.Register(ModuleName, 2, "invalid")
+            ErrInvalidData          = errorsmod.Register(ModuleName, 3, "invalid data")
+            ErrInvalidChecksum      = errorsmod.Register(ModuleName, 4, "invalid checksum")
+            ErrInvalidClientMessage = errorsmod.Register(ModuleName, 5, "invalid client message")
+            ErrRetrieveClientID     = errorsmod.Register(ModuleName, 6, "failed to retrieve client id")
+            // Wasm specific
+            ErrWasmEmptyCode                   = errorsmod.Register(ModuleName, 7, "empty wasm code")
+            ErrWasmCodeTooLarge                = errorsmod.Register(ModuleName, 8, "wasm code too large")
+            ErrWasmCodeExists                  = errorsmod.Register(ModuleName, 9, "wasm code already exists")
+            ErrWasmChecksumNotFound            = errorsmod.Register(ModuleName, 10, "wasm checksum not found")
+            ErrWasmSubMessagesNotAllowed       = errorsmod.Register(ModuleName, 11, "execution of sub messages is not allowed")
+            ErrWasmEventsNotAllowed            = errorsmod.Register(ModuleName, 12, "returning events from a contract is not allowed")
+            ErrWasmAttributesNotAllowed        = errorsmod.Register(ModuleName, 13, "returning attributes from a contract is not allowed")
+            ErrWasmContractCallFailed          = errorsmod.Register(ModuleName, 14, "wasm contract call failed")
+            ErrWasmInvalidResponseData         = errorsmod.Register(ModuleName, 15, "wasm contract returned invalid response data")
+            ErrWasmInvalidContractModification = errorsmod.Register(ModuleName, 16, "wasm contract made invalid state modifications")
+            ErrVMError                         = errorsmod.Register(ModuleName, 17, "wasm VM error")
+        )
+
+        // https://github.com/cosmos/ibc-go/blob/5ef01dae21dd60df22715b8e99bf641087a98879/modules/capability/types/errors.go
+        #[err(name = CapabilityError, codespace = "capability")]
+        var (
+            ErrInvalidCapabilityName    = errorsmod.Register(ModuleName, 2, "capability name not valid")
+            ErrNilCapability            = errorsmod.Register(ModuleName, 3, "provided capability is nil")
+            ErrCapabilityTaken          = errorsmod.Register(ModuleName, 4, "capability name already taken")
+            ErrOwnerClaimed             = errorsmod.Register(ModuleName, 5, "given owner already claimed capability")
+            ErrCapabilityNotOwned       = errorsmod.Register(ModuleName, 6, "capability not owned by module")
+            ErrCapabilityNotFound       = errorsmod.Register(ModuleName, 7, "capability not found")
+            ErrCapabilityOwnersNotFound = errorsmod.Register(ModuleName, 8, "owners not found for capability")
+        )
+        // https://github.com/cosmos/ibc-go/blob/7f89b7dd8796eca1bfe07f8a7833f3ce2d7a8e04/modules/core/02-client/types/errors.go
+        // IBC client sentinel errors
+        #[err(name = ClientError, codespace = "client")]
+        var (
+            ErrClientExists                           = errorsmod.Register(SubModuleName, 2, "light client already exists")
+            ErrInvalidClient                          = errorsmod.Register(SubModuleName, 3, "light client is invalid")
+            ErrClientNotFound                         = errorsmod.Register(SubModuleName, 4, "light client not found")
+            ErrClientFrozen                           = errorsmod.Register(SubModuleName, 5, "light client is frozen due to misbehaviour")
+            ErrInvalidClientMetadata                  = errorsmod.Register(SubModuleName, 6, "invalid client metadata")
+            ErrConsensusStateNotFound                 = errorsmod.Register(SubModuleName, 7, "consensus state not found")
+            ErrInvalidConsensus                       = errorsmod.Register(SubModuleName, 8, "invalid consensus state")
+            ErrClientTypeNotFound                     = errorsmod.Register(SubModuleName, 9, "client type not found")
+            ErrInvalidClientType                      = errorsmod.Register(SubModuleName, 10, "invalid client type")
+            ErrRootNotFound                           = errorsmod.Register(SubModuleName, 11, "commitment root not found")
+            ErrInvalidHeader                          = errorsmod.Register(SubModuleName, 12, "invalid client header")
+            ErrInvalidMisbehaviour                    = errorsmod.Register(SubModuleName, 13, "invalid light client misbehaviour")
+            ErrFailedClientStateVerification          = errorsmod.Register(SubModuleName, 14, "client state verification failed")
+            ErrFailedClientConsensusStateVerification = errorsmod.Register(SubModuleName, 15, "client consensus state verification failed")
+            ErrFailedConnectionStateVerification      = errorsmod.Register(SubModuleName, 16, "connection state verification failed")
+            ErrFailedChannelStateVerification         = errorsmod.Register(SubModuleName, 17, "channel state verification failed")
+            ErrFailedPacketCommitmentVerification     = errorsmod.Register(SubModuleName, 18, "packet commitment verification failed")
+            ErrFailedPacketAckVerification            = errorsmod.Register(SubModuleName, 19, "packet acknowledgement verification failed")
+            ErrFailedPacketReceiptVerification        = errorsmod.Register(SubModuleName, 20, "packet receipt verification failed")
+            ErrFailedNextSeqRecvVerification          = errorsmod.Register(SubModuleName, 21, "next sequence receive verification failed")
+            ErrSelfConsensusStateNotFound             = errorsmod.Register(SubModuleName, 22, "self consensus state not found")
+            ErrUpdateClientFailed                     = errorsmod.Register(SubModuleName, 23, "unable to update light client")
+            ErrInvalidRecoveryClient                  = errorsmod.Register(SubModuleName, 24, "invalid recovery client")
+            ErrInvalidUpgradeClient                   = errorsmod.Register(SubModuleName, 25, "invalid client upgrade")
+            ErrInvalidHeight                          = errorsmod.Register(SubModuleName, 26, "invalid height")
+            ErrInvalidSubstitute                      = errorsmod.Register(SubModuleName, 27, "invalid client state substitute")
+            ErrInvalidUpgradeProposal                 = errorsmod.Register(SubModuleName, 28, "invalid upgrade proposal")
+            ErrClientNotActive                        = errorsmod.Register(SubModuleName, 29, "client state is not active")
+            ErrFailedMembershipVerification           = errorsmod.Register(SubModuleName, 30, "membership verification failed")
+            ErrFailedNonMembershipVerification        = errorsmod.Register(SubModuleName, 31, "non-membership verification failed")
+            ErrRouteNotFound                          = errorsmod.Register(SubModuleName, 32, "light client module route not found")
+            ErrClientTypeNotSupported                 = errorsmod.Register(SubModuleName, 33, "client type not supported")
         )
     }
 }

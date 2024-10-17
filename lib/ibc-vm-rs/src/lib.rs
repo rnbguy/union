@@ -1,5 +1,3 @@
-#![feature(error_in_core)]
-
 use frame_support_procedural::PartialEqNoBound;
 use serde::{Deserialize, Serialize};
 use states::{
@@ -13,6 +11,7 @@ use states::{
 };
 use unionlabs::{
     encoding::{Decode, Encode, Proto},
+    events::IbcEvent,
     ibc::core::{
         channel::{self, order::Order, packet::Packet},
         client::height::Height,
@@ -22,8 +21,6 @@ use unionlabs::{
     ics24::Path,
     id::{ChannelId, ClientId, ConnectionId, PortId},
 };
-
-pub type IbcEvent = unionlabs::events::IbcEvent<ClientId, String, ClientId>;
 
 pub mod states;
 
@@ -125,24 +122,16 @@ pub trait IbcHost: Sized {
 
     fn client_state(&self, client_id: &str) -> Option<Vec<u8>>;
 
-    fn read<T: Decode<Proto>>(&self, path: &Path<ClientId, Height>) -> Option<T>;
+    fn read<T: Decode<Proto>>(&self, path: &Path) -> Option<T>;
 
-    fn read_raw(&self, key: &Path<ClientId, Height>) -> Option<Vec<u8>>;
+    fn read_raw(&self, key: &Path) -> Option<Vec<u8>>;
 
-    fn commit_raw(
-        &mut self,
-        key: Path<ClientId, Height>,
-        value: Vec<u8>,
-    ) -> Result<(), Self::Error>;
+    fn commit_raw(&mut self, key: Path, value: Vec<u8>) -> Result<(), Self::Error>;
 
     // TODO(aeryz): generic over encoding
-    fn commit<T: Encode<Proto>>(
-        &mut self,
-        key: Path<ClientId, Height>,
-        value: T,
-    ) -> Result<(), Self::Error>;
+    fn commit<T: Encode<Proto>>(&mut self, key: Path, value: T) -> Result<(), Self::Error>;
 
-    fn delete(&mut self, key: &Path<ClientId, Height>) -> Result<(), Self::Error>;
+    fn delete(&mut self, key: &Path) -> Result<(), Self::Error>;
 
     fn current_height(&self) -> Height;
 

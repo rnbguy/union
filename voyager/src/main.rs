@@ -1,89 +1,61 @@
-#![feature(trait_alias, min_exhaustive_patterns)]
-// #![warn(clippy::pedantic)]
+#![feature(trait_alias, try_find)]
+#![warn(clippy::pedantic)]
 #![allow(
-     // required due to return_position_impl_trait_in_trait false positives
+    // required due to return_position_impl_trait_in_trait false positives
     clippy::manual_async_fn,
-    clippy::large_enum_variant,
+    clippy::single_match_else,
     clippy::module_name_repetitions,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
 )]
 
 use std::{
-    collections::HashMap,
-    error::Error,
     ffi::OsString,
     fmt::{Debug, Write},
     fs::read_to_string,
     iter,
-    marker::PhantomData,
+    net::SocketAddr,
     process::ExitCode,
-    sync::Arc,
 };
 
-use chain_utils::{
-    any_chain,
-    arbitrum::Arbitrum,
-    berachain::Berachain,
-    cosmos::Cosmos,
-    ethereum::{Ethereum, EthereumConsensusChain},
-    keyring::ChainKeyring,
-    scroll::Scroll,
-    union::Union,
-    wasm::Wasm,
-    AnyChain, ChainConfigType, Chains, EthereumChainConfig, IncorrectChainTypeError,
-    LightClientType,
-};
+use chain_utils::BoxDynError;
 use clap::Parser;
-use queue_msg::{
-    aggregate,
-    aggregation::TupleAggregator,
-    conc, defer_relative, effect, event, fetch,
-    optimize::{passes::NormalizeFinal, Pure},
-    repeat, run_to_completion, seq, InMemoryQueue, Op,
-};
-use relay_message::{
-    aggregate::{
-        AggregateWaitForConnectionOpen, AggregateWaitForNextClientSequence,
-        AggregateWaitForNextConnectionSequence,
-    },
-    data::IbcState,
-    RelayMessage,
-};
+use pg_queue::PgQueueConfig;
+use schemars::gen::{SchemaGenerator, SchemaSettings};
 use serde::Serialize;
-use sqlx::query_as;
+use serde_json::json;
+use serde_utils::Hex;
 use tikv_jemallocator::Jemalloc;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
-use unionlabs::{
-    ethereum::config::{Mainnet, Minimal, PresetBaseKind},
-    ibc::core::{
-        channel::{self, channel::Channel, msg_channel_open_init::MsgChannelOpenInit},
-        commitment::merkle_prefix::MerklePrefix,
-        connection::{self, msg_connection_open_init::MsgConnectionOpenInit, version::Version},
-    },
-    ics24::{ConnectionPath, NextClientSequencePath, NextConnectionSequencePath},
-    id::ClientId,
-    traits::{Chain, ClientIdOf},
-    QueryHeight,
+use unionlabs::{ethereum::ibc_commitment_key, ics24, QueryHeight};
+use voyager_message::{
+    call::FetchBlocks,
+    context::{get_plugin_info, Context, ModulesConfig},
+    filter::{make_filter, run_filter},
+    VoyagerMessage,
 };
-use voyager_message::{FromOp, VoyagerFetch, VoyagerMessage};
+use voyager_vm::{call, filter::FilterResult, Op, Queue};
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
 use crate::{
-    cli::{
-        any_state_proof_to_json, AppArgs, ArbitrumCmd, BerachainCmd, Command, EthereumCmd,
-        HandshakeCmd, HandshakeType, QueryCmd, SignerCmd, UtilCmd,
-    },
-    config::{Config, GetChainError},
-    queue::{chains_from_config, AnyQueueConfig, RunError, Voyager, VoyagerInitError},
+    cli::{AppArgs, Command, ConfigCmd, ModuleCmd, PluginCmd, QueueCmd, UtilCmd},
+    config::{default_rest_laddr, default_rpc_laddr, Config, VoyagerConfig},
+    queue::{QueueConfig, Voyager, VoyagerInitError},
 };
 
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "voyager interacts directly with subprocesses and has \
+    not been tested on non-linux operating systems."
+);
+
+pub mod api;
 pub mod cli;
 pub mod config;
-
 pub mod queue;
-
-pub mod passes;
 
 fn main() -> ExitCode {
     let args = AppArgs::parse();
@@ -92,11 +64,13 @@ fn main() -> ExitCode {
         cli::LogFormat::Text => {
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::from_default_env())
+                // .with_span_events(FmtSpan::CLOSE)
                 .init();
         }
         cli::LogFormat::Json => {
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::from_default_env())
+                // .with_span_events(FmtSpan::CLOSE)
                 .json()
                 .init();
         }
@@ -140,74 +114,219 @@ pub enum VoyagerError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("error retrieving a chain from the config")]
-    GetChain(#[from] GetChainError),
     #[error("error initializing voyager")]
     Init(#[from] VoyagerInitError),
-    #[error("error while running migrations")]
-    Migrations(#[from] MigrationsError),
     #[error("fatal error encountered")]
-    Run(#[from] RunError),
+    Run(#[from] BoxDynError),
     #[error("unable to run command")]
-    Command(#[source] Box<dyn Error>),
-    #[error("chain was not of expected type")]
-    IncorrectChainType(#[from] IncorrectChainTypeError),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum MigrationsError {
-    #[error("running migrations requires the `pg-queue` queue config")]
-    IncorrectQueueConfig,
-    #[error(transparent)]
-    Sqlx(#[from] sqlx::Error),
-    #[error(transparent)]
-    Migrate(#[from] sqlx::migrate::MigrateError),
+    Command(#[source] BoxDynError),
 }
 
 #[allow(clippy::too_many_lines)]
 // NOTE: This function is a mess, will be cleaned up
-async fn do_main(args: cli::AppArgs) -> Result<(), VoyagerError> {
-    let mut voyager_config = read_to_string(&args.config_file_path)
-        .map_err(|err| VoyagerError::ConfigFileNotFound {
-            path: args.config_file_path.clone(),
-            source: err,
-        })
-        .and_then(|s| {
-            serde_json::from_str::<Config>(&s).map_err(|err| VoyagerError::ConfigFileParse {
-                path: args.config_file_path,
+async fn do_main(args: cli::AppArgs) -> Result<(), BoxDynError> {
+    let get_voyager_config = || match &args.config_file_path {
+        Some(config_file_path) => read_to_string(config_file_path)
+            .map_err(|err| VoyagerError::ConfigFileNotFound {
+                path: config_file_path.clone(),
                 source: err,
             })
-        })?;
+            .and_then(|s| {
+                serde_json::from_str::<Config>(&s).map_err(|err| VoyagerError::ConfigFileParse {
+                    path: config_file_path.clone(),
+                    source: err,
+                })
+            })
+            .map_err(Into::into),
+        None => Err::<_, BoxDynError>("config file must be specified".to_owned().into()),
+    };
 
     match args.command {
-        Command::RunMigrations => {
-            run_migrations(voyager_config).await?;
-        }
-        Command::PrintConfig => {
-            print_json(&voyager_config);
-        }
-        Command::Relay => {
-            let queue = Voyager::new(voyager_config.clone()).await?;
+        Command::Config(cmd) => match cmd {
+            ConfigCmd::Print => {
+                print_json(&get_voyager_config()?);
+            }
+            ConfigCmd::Default => print_json(&Config {
+                schema: None,
+                plugins: vec![],
+                modules: ModulesConfig {
+                    chain: vec![],
+                    consensus: vec![],
+                    client: vec![],
+                },
+                voyager: VoyagerConfig {
+                    num_workers: 1,
+                    rest_laddr: default_rest_laddr(),
+                    rpc_laddr: default_rpc_laddr(),
+                    queue: QueueConfig::PgQueue(PgQueueConfig {
+                        database_url: String::new(),
+                        max_connections: None,
+                        min_connections: None,
+                        idle_timeout: None,
+                        max_lifetime: None,
+                    }),
+                    optimizer_delay_milliseconds: 100,
+                },
+            }),
+            ConfigCmd::Schema => print_json(
+                &SchemaGenerator::new(SchemaSettings::draft2019_09().with(|s| {
+                    s.option_nullable = true;
+                    s.option_add_null_type = false;
+                }))
+                .into_root_schema_for::<Config>(),
+            ),
+        },
+        Command::Start => {
+            let voyager = Voyager::new(get_voyager_config()?).await?;
 
-            queue.run().await?;
+            info!("starting relay service");
+
+            voyager.run().await?;
         }
-        Command::Query {
-            on: on_name,
-            at,
-            cmd,
-            tracking,
-        } => {
-            query(&mut voyager_config, on_name, tracking, cmd, at).await?;
-        }
-        Command::Queue(cli_msg) => {
-            let db = match voyager_config.voyager.queue {
-                AnyQueueConfig::PgQueue(cfg) => cfg.into_pg_pool().await.unwrap(),
-                _ => panic!("no database set in config"),
+        Command::Plugin(cmd) => match cmd {
+            PluginCmd::Interest {
+                plugin_name,
+                message,
+            } => {
+                let plugin_config = get_voyager_config()?
+                    .plugins
+                    .into_iter()
+                    .try_find(|plugin_config| {
+                        Ok::<_, BoxDynError>(plugin_name == get_plugin_info(plugin_config)?.name)
+                    })?
+                    .ok_or("plugin not found".to_owned())?;
+
+                let (filter, plugin_name) = make_filter(get_plugin_info(&plugin_config)?)?;
+
+                let result = run_filter(
+                    &filter,
+                    &plugin_name,
+                    serde_json::from_str::<serde_json::Value>(&message)?.into(),
+                );
+
+                match result {
+                    Ok(FilterResult::Interest(tag)) => println!("interest ({tag})"),
+                    Ok(FilterResult::NoInterest) => println!("no interest"),
+                    Err(()) => println!("failed"),
+                }
+            }
+            PluginCmd::Info { plugin_name } => {
+                let plugin_config = get_voyager_config()?
+                    .plugins
+                    .into_iter()
+                    .try_find(|plugin_config| {
+                        Ok::<_, BoxDynError>(plugin_name == get_plugin_info(plugin_config)?.name)
+                    })?
+                    .ok_or("plugin not found".to_owned())?;
+
+                print_json(&get_plugin_info(&plugin_config)?);
+            }
+            PluginCmd::Call { plugin_name, args } => match plugin_name {
+                Some(module_name) => {
+                    let plugin_config = get_voyager_config()?
+                        .plugins
+                        .into_iter()
+                        .try_find(|plugin_config| {
+                            Ok::<_, BoxDynError>(
+                                module_name == get_plugin_info(plugin_config)?.name,
+                            )
+                        })?
+                        .ok_or("plugin not found".to_owned())?;
+
+                    tokio::process::Command::new(&plugin_config.path)
+                        .arg("cmd")
+                        .arg("--config")
+                        .arg(plugin_config.config.to_string())
+                        .args(args)
+                        .spawn()?
+                        .wait()
+                        .await?;
+                }
+                None => {
+                    println!("available plugins and modules");
+                    for module_config in get_voyager_config()?.plugins {
+                        println!("  {}", get_plugin_info(&module_config)?.name);
+                    }
+                }
+            },
+        },
+        Command::Module(cmd) => match cmd {
+            ModuleCmd::Chain(_) => todo!(),
+            ModuleCmd::Consensus(_) => todo!(),
+            ModuleCmd::Client(_) => todo!(),
+        },
+        Command::Query { on, height, path } => {
+            let voyager = Voyager::new(get_voyager_config()?).await?;
+
+            let height = voyager.context.rpc_server.query_height(&on, height).await?;
+
+            let state = voyager
+                .context
+                .rpc_server
+                .query_ibc_state(&on, height, path.clone())
+                .await?
+                .state;
+
+            let state = match &path {
+                ics24::Path::ClientState(path) => {
+                    let client_info = voyager
+                        .context
+                        .rpc_server
+                        .client_info(&on, path.client_id.clone())
+                        .await?;
+
+                    voyager
+                        .context
+                        .rpc_server
+                        .decode_client_state(
+                            &client_info.client_type,
+                            &client_info.ibc_interface,
+                            serde_json::from_value::<Hex<Vec<u8>>>(state).unwrap().0,
+                        )
+                        .await?
+                }
+                ics24::Path::ClientConsensusState(path) => {
+                    let client_info = voyager
+                        .context
+                        .rpc_server
+                        .client_info(&on, path.client_id.clone())
+                        .await?;
+
+                    voyager
+                        .context
+                        .rpc_server
+                        .decode_consensus_state(
+                            &client_info.client_type,
+                            &client_info.ibc_interface,
+                            serde_json::from_value::<Hex<Vec<u8>>>(state).unwrap().0,
+                        )
+                        .await?
+                }
+                _ => state,
             };
 
-            type Item = sqlx::types::Json<Op<VoyagerMessage>>;
+            voyager.shutdown().await;
+
+            print_json(&json!({
+               "path": path.to_string(),
+               "state": state,
+            }));
+        }
+        Command::Queue(cli_msg) => {
+            let db = match get_voyager_config()?.voyager.queue {
+                QueueConfig::PgQueue(cfg) => pg_queue::PgQueue::<VoyagerMessage>::new(cfg).await?,
+                QueueConfig::InMemory => {
+                    return Err("no database set in config, queue commands \
+                        require the `pg-queue` database backend"
+                        .to_string()
+                        .into())
+                }
+            };
 
             match cli_msg {
+                QueueCmd::Enqueue { op } => {
+                    send_enqueue(&get_voyager_config()?.voyager.rest_laddr, op).await?;
+                }
                 // NOTE: Temporarily disabled until i figure out a better way to implement this with the new queue design
                 // cli::QueueCmd::History { id, max_depth } => {
                 //     // let results = query_as!(
@@ -224,981 +343,161 @@ async fn do_main(args: cli::AppArgs) -> Result<(), VoyagerError> {
 
                 //     todo!();
                 // }
-                cli::QueueCmd::Failed { page, per_page } => {
-                    #[derive(Debug, serde::Serialize)]
-                    struct Record {
-                        id: i64,
-                        message: String,
-                        item: Item,
-                    }
+                QueueCmd::QueryFailed {
+                    page,
+                    per_page,
+                    item_filters,
+                    message_filters,
+                } => {
+                    let record = db
+                        .query_failed(page.into(), per_page.into(), item_filters, message_filters)
+                        .await?;
 
-                    let results = query_as!(
-                        Record,
-                        r#"SELECT id, item as "item: Item", message as "message!" FROM queue WHERE status = 'failed' ORDER BY id ASC LIMIT $1 OFFSET $2"#,
-                        per_page.inner(),
-                        ((page.inner() - 1) * per_page.inner()),
-                    )
-                    .fetch_all(&db)
-                    .await
-                    .unwrap();
+                    print_json(&record);
+                }
+                QueueCmd::QueryFailedById { id } => {
+                    let record = db.query_failed_by_id(id.inner()).await?;
 
-                    print_json(&results);
+                    print_json(&record);
                 }
             }
         }
-        Command::Handshake(HandshakeCmd {
-            chain_a,
-            chain_b,
-            ty,
-        }) => {
-            let chain_a = voyager_config.get_chain(&chain_a).await?;
-            let chain_b = voyager_config.get_chain(&chain_b).await?;
+        Command::Handshake(_) => todo!(),
+        // Command::Handshake(HandshakeCmd {
+        //     chain_a,
+        //     chain_b,
+        //     ty,
+        // }) => {
+        //     let chain_a = voyager_config.get_chain(&chain_a).await?;
+        //     let chain_b = voyager_config.get_chain(&chain_b).await?;
 
-            let chains = Arc::new(chains_from_config(voyager_config.chain).await.unwrap());
+        //     let chains = Arc::new(chains_from_config(voyager_config.chain).await.unwrap());
 
-            let all_msgs = match (chain_a, chain_b) {
-                (AnyChain::Union(union), AnyChain::Cosmos(cosmos)) => {
-                    mk_handshake::<Union, Wasm<Cosmos>>(&union, &Wasm(cosmos), ty, chains).await
+        //     let all_msgs = match (chain_a, chain_b) {
+        //         (AnyChain::Union(union), AnyChain::Cosmos(cosmos)) => {
+        //             mk_handshake::<Union, Wasm<Cosmos>>(&union, &Wasm(cosmos), ty, chains).await
+        //         }
+        //         (AnyChain::Union(union), AnyChain::EthereumMainnet(ethereum)) => {
+        //             mk_handshake::<Wasm<Union>, Ethereum<Mainnet>>(
+        //                 &Wasm(union),
+        //                 &ethereum,
+        //                 ty,
+        //                 chains,
+        //             )
+        //             .await
+        //         }
+        //         (AnyChain::Union(union), AnyChain::EthereumMinimal(ethereum)) => {
+        //             mk_handshake::<Wasm<Union>, Ethereum<Minimal>>(
+        //                 &Wasm(union),
+        //                 &ethereum,
+        //                 ty,
+        //                 chains,
+        //             )
+        //             .await
+        //         }
+        //         (AnyChain::Union(union), AnyChain::Scroll(scroll)) => {
+        //             mk_handshake::<Wasm<Union>, Scroll>(&Wasm(union), &scroll, ty, chains).await
+        //         }
+        //         (AnyChain::Union(union), AnyChain::Arbitrum(scroll)) => {
+        //             mk_handshake::<Wasm<Union>, Arbitrum>(&Wasm(union), &scroll, ty, chains).await
+        //         }
+        //         (AnyChain::Union(union), AnyChain::Berachain(berachain)) => {
+        //             mk_handshake::<Wasm<Union>, Berachain>(&Wasm(union), &berachain, ty, chains)
+        //                 .await
+        //         }
+        //         (AnyChain::Cosmos(cosmos), AnyChain::Union(union)) => {
+        //             mk_handshake::<Wasm<Cosmos>, Union>(&Wasm(cosmos), &union, ty, chains).await
+        //         }
+        //         (AnyChain::Cosmos(cosmos_a), AnyChain::Cosmos(cosmos_b)) => {
+        //             mk_handshake::<Cosmos, Cosmos>(&cosmos_a, &cosmos_b, ty, chains).await
+        //         }
+        //         (AnyChain::EthereumMainnet(ethereum), AnyChain::Union(union)) => {
+        //             mk_handshake::<Ethereum<Mainnet>, Wasm<Union>>(
+        //                 &ethereum,
+        //                 &Wasm(union),
+        //                 ty,
+        //                 chains,
+        //             )
+        //             .await
+        //         }
+        //         (AnyChain::EthereumMinimal(ethereum), AnyChain::Union(union)) => {
+        //             mk_handshake::<Ethereum<Minimal>, Wasm<Union>>(
+        //                 &ethereum,
+        //                 &Wasm(union),
+        //                 ty,
+        //                 chains,
+        //             )
+        //             .await
+        //         }
+        //         (AnyChain::Scroll(scroll), AnyChain::Union(union)) => {
+        //             mk_handshake::<Scroll, Wasm<Union>>(&scroll, &Wasm(union), ty, chains).await
+        //         }
+        //         (AnyChain::Arbitrum(scroll), AnyChain::Union(union)) => {
+        //             mk_handshake::<Arbitrum, Wasm<Union>>(&scroll, &Wasm(union), ty, chains).await
+        //         }
+        //         (AnyChain::Berachain(berachain), AnyChain::Union(union)) => {
+        //             mk_handshake::<Berachain, Wasm<Union>>(&berachain, &Wasm(union), ty, chains)
+        //                 .await
+        //         }
+        //         _ => panic!("invalid"),
+        //     };
+
+        //     print_json(&all_msgs);
+        // }
+        Command::InitFetch {
+            chain_id,
+            height,
+            enqueue,
+        } => {
+            let start_height = match height {
+                QueryHeight::Latest => {
+                    let config = get_voyager_config()?;
+
+                    let context = Context::new(config.plugins, config.modules).await?;
+
+                    let latest_height = context.rpc_server.query_latest_height(&chain_id).await?;
+
+                    context.shutdown().await;
+
+                    latest_height
                 }
-                (AnyChain::Union(union), AnyChain::EthereumMainnet(ethereum)) => {
-                    mk_handshake::<Wasm<Union>, Ethereum<Mainnet>>(
-                        &Wasm(union),
-                        &ethereum,
-                        ty,
-                        chains,
-                    )
-                    .await
-                }
-                (AnyChain::Union(union), AnyChain::EthereumMinimal(ethereum)) => {
-                    mk_handshake::<Wasm<Union>, Ethereum<Minimal>>(
-                        &Wasm(union),
-                        &ethereum,
-                        ty,
-                        chains,
-                    )
-                    .await
-                }
-                (AnyChain::Union(union), AnyChain::Scroll(scroll)) => {
-                    mk_handshake::<Wasm<Union>, Scroll>(&Wasm(union), &scroll, ty, chains).await
-                }
-                (AnyChain::Union(union), AnyChain::Arbitrum(scroll)) => {
-                    mk_handshake::<Wasm<Union>, Arbitrum>(&Wasm(union), &scroll, ty, chains).await
-                }
-                (AnyChain::Union(union), AnyChain::Berachain(berachain)) => {
-                    mk_handshake::<Wasm<Union>, Berachain>(&Wasm(union), &berachain, ty, chains)
-                        .await
-                }
-                (AnyChain::Cosmos(cosmos), AnyChain::Union(union)) => {
-                    mk_handshake::<Wasm<Cosmos>, Union>(&Wasm(cosmos), &union, ty, chains).await
-                }
-                (AnyChain::Cosmos(cosmos_a), AnyChain::Cosmos(cosmos_b)) => {
-                    mk_handshake::<Cosmos, Cosmos>(&cosmos_a, &cosmos_b, ty, chains).await
-                }
-                (AnyChain::EthereumMainnet(ethereum), AnyChain::Union(union)) => {
-                    mk_handshake::<Ethereum<Mainnet>, Wasm<Union>>(
-                        &ethereum,
-                        &Wasm(union),
-                        ty,
-                        chains,
-                    )
-                    .await
-                }
-                (AnyChain::EthereumMinimal(ethereum), AnyChain::Union(union)) => {
-                    mk_handshake::<Ethereum<Minimal>, Wasm<Union>>(
-                        &ethereum,
-                        &Wasm(union),
-                        ty,
-                        chains,
-                    )
-                    .await
-                }
-                (AnyChain::Scroll(scroll), AnyChain::Union(union)) => {
-                    mk_handshake::<Scroll, Wasm<Union>>(&scroll, &Wasm(union), ty, chains).await
-                }
-                (AnyChain::Arbitrum(scroll), AnyChain::Union(union)) => {
-                    mk_handshake::<Arbitrum, Wasm<Union>>(&scroll, &Wasm(union), ty, chains).await
-                }
-                (AnyChain::Berachain(berachain), AnyChain::Union(union)) => {
-                    mk_handshake::<Berachain, Wasm<Union>>(&berachain, &Wasm(union), ty, chains)
-                        .await
-                }
-                _ => panic!("invalid"),
+                QueryHeight::Specific(height) => height,
             };
 
-            print_json(&all_msgs);
-        }
-        Command::InitFetch { on } => {
-            let on = voyager_config.get_chain(&on).await?;
+            let op = call::<VoyagerMessage>(FetchBlocks {
+                chain_id: chain_id.clone(),
+                start_height,
+            });
 
-            let msg = any_chain!(|on| mk_init_fetch::<Hc>(&on).await);
-
-            print_json(&msg);
+            if enqueue {
+                println!("enqueueing op for `{chain_id}` at `{start_height}`");
+                send_enqueue(&get_voyager_config()?.voyager.rest_laddr, op).await?;
+            } else {
+                print_json(&op);
+            }
         }
         Command::Util(util) => match util {
-            UtilCmd::QueryLatestHeight { on } => {
-                let on = voyager_config.get_chain(&on).await?;
-
-                // TODO: Figure out how to use `any_chain!` here
-                let height = match on {
-                    AnyChain::Union(on) => on
-                        .query_latest_height()
-                        .await
-                        .map_err(|e| VoyagerError::Command(Box::new(e)))?,
-                    AnyChain::Cosmos(on) => on
-                        .query_latest_height()
-                        .await
-                        .map_err(|e| VoyagerError::Command(Box::new(e)))?,
-                    AnyChain::EthereumMainnet(on) => on
-                        .query_latest_height()
-                        .await
-                        .map_err(|e| VoyagerError::Command(Box::new(e)))?,
-                    AnyChain::EthereumMinimal(on) => on
-                        .query_latest_height()
-                        .await
-                        .map_err(|e| VoyagerError::Command(Box::new(e)))?,
-                    AnyChain::Scroll(on) => on
-                        .query_latest_height()
-                        .await
-                        .map_err(|e| VoyagerError::Command(e))?,
-                    AnyChain::Arbitrum(on) => on
-                        .query_latest_height()
-                        .await
-                        .map_err(|e| VoyagerError::Command(e))?,
-                    AnyChain::Berachain(on) => on
-                        .query_latest_height()
-                        .await
-                        .map_err(|e| VoyagerError::Command(Box::new(e)))?,
-                };
-
-                print_json(&height);
-            }
-            UtilCmd::QuerySelfConsensusState { on, height } => {
-                let on = voyager_config.get_chain(&on).await?;
-
-                any_chain!(|on| {
-                    let height = match height {
-                        QueryHeight::Latest => on.query_latest_height().await.unwrap(),
-                        QueryHeight::Specific(height) => height,
-                    };
-
-                    print_json(&on.self_consensus_state(height).await)
-                });
-            }
-            UtilCmd::QuerySelfClientState { on, height } => {
-                let on = voyager_config.get_chain(&on).await?;
-
-                any_chain!(|on| {
-                    let height = match height {
-                        QueryHeight::Latest => on.query_latest_height().await.unwrap(),
-                        QueryHeight::Specific(height) => height,
-                    };
-
-                    print_json(&on.self_client_state(height).await)
-                });
-            }
-            UtilCmd::Arbitrum(cmd) => match cmd {
-                ArbitrumCmd::NextNodeNumAtBeaconSlot { on, slot } => print_json(
-                    &voyager_config
-                        .get_chain(&on.to_string())
-                        .await?
-                        .downcast::<Arbitrum>()?
-                        .next_node_num_at_beacon_slot(slot)
-                        .await,
-                ),
-                ArbitrumCmd::ExecutionHeightOfBeaconSlot { on, slot } => print_json(
-                    &voyager_config
-                        .get_chain(&on.to_string())
-                        .await?
-                        .downcast::<Arbitrum>()?
-                        .execution_height_of_beacon_slot(slot)
-                        .await,
-                ),
-            },
-            UtilCmd::Berachain(cmd) => match cmd {
-                BerachainCmd::ExecutionHeightOfBeaconSlot { on, slot } => print_json(
-                    &voyager_config
-                        .get_chain(&on.to_string())
-                        .await?
-                        .downcast::<Berachain>()?
-                        .execution_height_of_beacon_slot(slot)
-                        .await,
-                ),
-                BerachainCmd::ExecutionHeaderAtBeaconSlot { on, slot } => print_json(
-                    &voyager_config
-                        .get_chain(&on.to_string())
-                        .await?
-                        .downcast::<Berachain>()?
-                        .execution_header_at_beacon_slot(slot)
-                        .await,
-                ),
-                BerachainCmd::BeaconHeaderAtBeaconSlot { on, slot } => print_json(
-                    &voyager_config
-                        .get_chain(&on.to_string())
-                        .await?
-                        .downcast::<Berachain>()?
-                        .beacon_block_header_at_beacon_slot(slot)
-                        .await,
-                ),
-            },
-            UtilCmd::Ethereum(cmd) => match cmd {
-                EthereumCmd::ExecutionHeightOfBeaconSlot { on, slot } => {
-                    print_json(&match voyager_config.get_chain(&on.to_string()).await? {
-                        AnyChain::EthereumMainnet(on) => {
-                            on.execution_height_of_beacon_slot(slot).await
-                        }
-                        AnyChain::EthereumMinimal(on) => {
-                            on.execution_height_of_beacon_slot(slot).await
-                        }
-                        chain => panic!(
-                            "chain type for `{}` not supported for this method",
-                            chain.chain_id()
-                        ),
-                    })
-                }
-            },
-        },
-        Command::Signer(cmd) => match cmd {
-            SignerCmd::Balances { on } => match on {
-                Some(on) => {
-                    let on = voyager_config.get_chain(&on).await.unwrap();
-
-                    any_chain!(|on| {
-                        print_json(&on.balances().await);
-                    });
-                }
-                None => {
-                    let chains = chains_from_config(voyager_config.chain).await.unwrap();
-
-                    let balances = signer_balances(&chains).await;
-
-                    print_json(&balances);
-                }
-            },
+            UtilCmd::IbcCommitmentKey {
+                path,
+                commitment_slot,
+            } => print_json(&ibc_commitment_key(&path.to_string(), commitment_slot).to_be_hex()),
         },
     }
 
     Ok(())
 }
 
-async fn signer_balances(chains: &Chains) -> HashMap<String, serde_json::Value> {
-    let mut balances = HashMap::new();
-
-    for (chain_id, chain) in &chains.chains {
-        any_chain!(|chain| {
-            balances.insert(
-                chain_id.to_string(),
-                serde_json::to_value(chain.balances().await).unwrap(),
-            );
-        });
-    }
-
-    balances
-}
-
-async fn query(
-    voyager_config: &mut Config,
-    on_name: String,
-    tracking: String,
-    cmd: QueryCmd,
-    at: QueryHeight<unionlabs::ibc::core::client::height::Height>,
-) -> Result<(), VoyagerError> {
-    let on = voyager_config.get_chain(&on_name).await?;
-    let tracking = voyager_config
-        .chain
-        .get(&tracking)
-        .expect("chain not found in config")
-        .clone();
-
-    let chains = Arc::new(
-        chains_from_config(
-            [voyager_config
-                .chain
-                .remove_entry(&on_name)
-                .expect("chain is present as it was retrieved previously")]
-            .into_iter()
-            .collect(),
-        )
-        .await
-        .unwrap(),
-    );
-    match cmd {
-        QueryCmd::IbcPath(path) => {
-            let json = match (on, &tracking.ty) {
-                (AnyChain::Union(union), ChainConfigType::Cosmos(_)) => {
-                    any_state_proof_to_json::<Union, Wasm<Cosmos>>(chains, path, union, at).await
-                }
-                (
-                    AnyChain::Union(union),
-                    ChainConfigType::Ethereum(EthereumChainConfig {
-                        preset_base: PresetBaseKind::Mainnet,
-                        ..
-                    }),
-                ) => {
-                    // NOTE: ChainSpec is arbitrary
-                    any_state_proof_to_json::<Wasm<Union>, Ethereum<Mainnet>>(
-                        chains,
-                        path,
-                        Wasm(union),
-                        at,
-                    )
-                    .await
-                }
-                (AnyChain::Union(union), ChainConfigType::Scroll(_)) => {
-                    any_state_proof_to_json::<Wasm<Union>, Scroll>(chains, path, Wasm(union), at)
-                        .await
-                }
-                (AnyChain::Union(union), ChainConfigType::Arbitrum(_)) => {
-                    any_state_proof_to_json::<Wasm<Union>, Arbitrum>(chains, path, Wasm(union), at)
-                        .await
-                }
-                (
-                    AnyChain::Union(union),
-                    ChainConfigType::Ethereum(EthereumChainConfig {
-                        preset_base: PresetBaseKind::Minimal,
-                        ..
-                    }),
-                ) => {
-                    any_state_proof_to_json::<Wasm<Union>, Ethereum<Minimal>>(
-                        chains,
-                        path,
-                        Wasm(union),
-                        at,
-                    )
-                    .await
-                }
-                (AnyChain::Union(union), ChainConfigType::Berachain(_)) => {
-                    any_state_proof_to_json::<Wasm<Union>, Berachain>(chains, path, Wasm(union), at)
-                        .await
-                }
-                (AnyChain::Cosmos(cosmos), ChainConfigType::Union(_)) => {
-                    // NOTE: ChainSpec is arbitrary
-                    any_state_proof_to_json::<Wasm<Cosmos>, Union>(chains, path, Wasm(cosmos), at)
-                        .await
-                }
-                (AnyChain::EthereumMainnet(ethereum), ChainConfigType::Union(_)) => {
-                    any_state_proof_to_json::<Ethereum<Mainnet>, Wasm<Union>>(
-                        chains, path, ethereum, at,
-                    )
-                    .await
-                }
-
-                (AnyChain::EthereumMinimal(ethereum), ChainConfigType::Union(_)) => {
-                    any_state_proof_to_json::<Ethereum<Minimal>, Wasm<Union>>(
-                        chains, path, ethereum, at,
-                    )
-                    .await
-                }
-
-                (AnyChain::Scroll(scroll), ChainConfigType::Union(_)) => {
-                    any_state_proof_to_json::<Scroll, Wasm<Union>>(chains, path, scroll, at).await
-                }
-
-                (AnyChain::Arbitrum(arbitrum), ChainConfigType::Union(_)) => {
-                    any_state_proof_to_json::<Arbitrum, Wasm<Union>>(chains, path, arbitrum, at)
-                        .await
-                }
-
-                (AnyChain::Berachain(berachain), ChainConfigType::Union(_)) => {
-                    any_state_proof_to_json::<Berachain, Wasm<Union>>(chains, path, berachain, at)
-                        .await
-                }
-                (AnyChain::Cosmos(cosmos), ChainConfigType::Cosmos(_)) => {
-                    any_state_proof_to_json::<Cosmos, Cosmos>(chains, path, cosmos, at).await
-                }
-
-                _ => panic!("unsupported"),
-            };
-
-            print_json(&json);
-        }
-    };
-
-    Ok(())
-}
-
-async fn run_migrations(_voyager_config: Config) -> Result<(), VoyagerError> {
-    // let AnyQueueConfig::PgQueue(PgQueueConfig { database_url, .. }) = voyager_config.voyager.queue
-    // else {
-    //     return Err(VoyagerError::Migrations(
-    //         MigrationsError::IncorrectQueueConfig,
-    //     ));
-    // };
-
-    // let pool = PgPool::connect(&database_url)
-    //     .await
-    //     .map_err(MigrationsError::Sqlx)?;
-
-    // pg_queue::MIGRATOR
-    //     .run(&pool)
-    //     .await
-    //     .map_err(MigrationsError::Migrate)?;
-
-    // Ok(())
-
-    todo!()
+async fn send_enqueue(
+    rest_laddr: &SocketAddr,
+    op: Op<VoyagerMessage>,
+) -> Result<reqwest::Response, BoxDynError> {
+    Ok(reqwest::Client::new()
+        .post(format!("http://{rest_laddr}/enqueue"))
+        .json(&op)
+        .send()
+        .await?)
 }
 
 fn print_json<T: Serialize>(t: &T) {
-    println!("{}", serde_json::to_string(&t).unwrap())
+    println!("{}", serde_json::to_string(&t).unwrap());
 }
-
-async fn mk_handshake<A, B>(
-    a: &A,
-    b: &B,
-    ty: HandshakeType,
-    chains: Arc<Chains>,
-) -> Op<VoyagerMessage>
-where
-    A: relay_message::ChainExt<ClientId: TryFrom<ClientId, Error: Debug>> + LightClientType<B>,
-    B: relay_message::ChainExt<ClientId: TryFrom<ClientId, Error: Debug>> + LightClientType<A>,
-
-    relay_message::AnyLightClientIdentified<relay_message::fetch::AnyFetch>:
-        From<relay_message::Identified<A, B, relay_message::fetch::Fetch<A, B>>>,
-    relay_message::AnyLightClientIdentified<relay_message::fetch::AnyFetch>:
-        From<relay_message::Identified<B, A, relay_message::fetch::Fetch<B, A>>>,
-
-    relay_message::AnyLightClientIdentified<relay_message::data::AnyData>:
-        From<relay_message::Identified<A, B, relay_message::data::Data<A, B>>>,
-    relay_message::AnyLightClientIdentified<relay_message::data::AnyData>:
-        From<relay_message::Identified<B, A, relay_message::data::Data<B, A>>>,
-
-    relay_message::AnyLightClientIdentified<relay_message::aggregate::AnyAggregate>:
-        From<relay_message::Identified<A, B, relay_message::aggregate::Aggregate<A, B>>>,
-    relay_message::AnyLightClientIdentified<relay_message::aggregate::AnyAggregate>:
-        From<relay_message::Identified<B, A, relay_message::aggregate::Aggregate<B, A>>>,
-
-    relay_message::AnyLightClientIdentified<relay_message::event::AnyEvent>:
-        From<relay_message::Identified<A, B, relay_message::event::Event<A, B>>>,
-    relay_message::AnyLightClientIdentified<relay_message::event::AnyEvent>:
-        From<relay_message::Identified<B, A, relay_message::event::Event<B, A>>>,
-
-    relay_message::AnyLightClientIdentified<relay_message::effect::AnyEffect>:
-        From<relay_message::Identified<A, B, relay_message::effect::Effect<A, B>>>,
-    relay_message::AnyLightClientIdentified<relay_message::effect::AnyEffect>:
-        From<relay_message::Identified<B, A, relay_message::effect::Effect<B, A>>>,
-
-    relay_message::Identified<A, B, relay_message::data::IbcState<NextClientSequencePath, A, B>>:
-        relay_message::use_aggregate::IsAggregateData,
-    relay_message::Identified<B, A, relay_message::data::IbcState<NextClientSequencePath, B, A>>:
-        relay_message::use_aggregate::IsAggregateData,
-
-    relay_message::Identified<
-        A,
-        B,
-        relay_message::data::IbcState<NextConnectionSequencePath, A, B>,
-    >: relay_message::use_aggregate::IsAggregateData,
-    relay_message::Identified<
-        B,
-        A,
-        relay_message::data::IbcState<NextConnectionSequencePath, B, A>,
-    >: relay_message::use_aggregate::IsAggregateData,
-{
-    let get_next_client_sequences = || async {
-        run_to_completion::<
-            TupleAggregator,
-            RelayMessage,
-            (
-                relay_message::Identified<A, B, IbcState<NextClientSequencePath, A, B>>,
-                (
-                    relay_message::Identified<B, A, IbcState<NextClientSequencePath, B, A>>,
-                    (),
-                ),
-            ),
-            InMemoryQueue<RelayMessage>,
-            _,
-            _,
-        >(
-            TupleAggregator,
-            chains.clone(),
-            (),
-            [
-                fetch(relay_message::id::<A, B, _>(
-                    a.chain_id(),
-                    relay_message::fetch::FetchState {
-                        at: QueryHeight::Latest,
-                        path: NextClientSequencePath {}.into(),
-                    },
-                )),
-                fetch(relay_message::id::<B, A, _>(
-                    b.chain_id(),
-                    relay_message::fetch::FetchState {
-                        at: QueryHeight::Latest,
-                        path: NextClientSequencePath {}.into(),
-                    },
-                )),
-            ],
-            NormalizeFinal::default(),
-            Pure(NormalizeFinal::default()),
-        )
-        .await
-    };
-
-    let get_next_connection_sequences = || async {
-        run_to_completion::<
-            TupleAggregator,
-            RelayMessage,
-            (
-                relay_message::Identified<A, B, IbcState<NextConnectionSequencePath, A, B>>,
-                (
-                    relay_message::Identified<B, A, IbcState<NextConnectionSequencePath, B, A>>,
-                    (),
-                ),
-            ),
-            InMemoryQueue<RelayMessage>,
-            _,
-            _,
-        >(
-            TupleAggregator,
-            chains.clone(),
-            (),
-            [
-                fetch(relay_message::id::<A, B, _>(
-                    a.chain_id(),
-                    relay_message::fetch::FetchState {
-                        at: QueryHeight::Latest,
-                        path: NextConnectionSequencePath {}.into(),
-                    },
-                )),
-                fetch(relay_message::id::<B, A, _>(
-                    b.chain_id(),
-                    relay_message::fetch::FetchState {
-                        at: QueryHeight::Latest,
-                        path: NextConnectionSequencePath {}.into(),
-                    },
-                )),
-            ],
-            NormalizeFinal::default(),
-            Pure(NormalizeFinal::default()),
-        )
-        .await
-    };
-
-    let mk_create_client_msgs = |client_a_config: serde_json::Value,
-                                 client_b_config: serde_json::Value,
-                                 next_client_sequence_a,
-                                 next_client_sequence_b,
-                                 msgs: Op<RelayMessage>| {
-        let client_config_a =
-            serde_json::from_value::<<A as relay_message::ChainExt>::Config>(client_a_config)
-                .unwrap();
-        let client_config_b =
-            serde_json::from_value::<<B as relay_message::ChainExt>::Config>(client_b_config)
-                .unwrap();
-
-        seq([
-            // create both clients, in parallel
-            conc::<RelayMessage>([
-                aggregate(
-                    [
-                        fetch(relay_message::id::<B, A, _>(
-                            b.chain_id(),
-                            relay_message::fetch::FetchSelfClientState {
-                                at: QueryHeight::Latest,
-                                __marker: PhantomData,
-                            },
-                        )),
-                        fetch(relay_message::id::<B, A, _>(
-                            b.chain_id(),
-                            relay_message::fetch::FetchSelfConsensusState {
-                                at: QueryHeight::Latest,
-                                __marker: PhantomData,
-                            },
-                        )),
-                    ],
-                    [],
-                    relay_message::id::<A, B, _>(
-                        a.chain_id(),
-                        relay_message::aggregate::AggregateMsgCreateClient {
-                            config: client_config_a,
-                            __marker: PhantomData,
-                        },
-                    ),
-                ),
-                aggregate(
-                    [
-                        fetch(relay_message::id::<A, B, _>(
-                            a.chain_id(),
-                            relay_message::fetch::FetchSelfClientState {
-                                at: QueryHeight::Latest,
-                                __marker: PhantomData,
-                            },
-                        )),
-                        fetch(relay_message::id::<A, B, _>(
-                            a.chain_id(),
-                            relay_message::fetch::FetchSelfConsensusState {
-                                at: QueryHeight::Latest,
-                                __marker: PhantomData,
-                            },
-                        )),
-                    ],
-                    [],
-                    relay_message::id::<B, A, _>(
-                        b.chain_id(),
-                        relay_message::aggregate::AggregateMsgCreateClient {
-                            config: client_config_b,
-                            __marker: PhantomData,
-                        },
-                    ),
-                ),
-            ]),
-            // wait for the next client sequence to increase
-            conc([
-                aggregate(
-                    [fetch(relay_message::id::<A, B, _>(
-                        a.chain_id(),
-                        relay_message::fetch::FetchState {
-                            at: QueryHeight::Latest,
-                            path: NextClientSequencePath {}.into(),
-                        },
-                    ))],
-                    [],
-                    relay_message::id::<A, B, _>(
-                        a.chain_id(),
-                        AggregateWaitForNextClientSequence {
-                            // increment because we wait for the current next sequence to increase
-                            sequence: next_client_sequence_a + 1,
-                            __marker: PhantomData,
-                        },
-                    ),
-                ),
-                aggregate(
-                    [fetch(relay_message::id::<B, A, _>(
-                        b.chain_id(),
-                        relay_message::fetch::FetchState {
-                            at: QueryHeight::Latest,
-                            path: NextClientSequencePath {}.into(),
-                        },
-                    ))],
-                    [],
-                    relay_message::id::<B, A, _>(
-                        b.chain_id(),
-                        AggregateWaitForNextClientSequence {
-                            // increment because we wait for the current next sequence to increase
-                            sequence: next_client_sequence_b + 1,
-                            __marker: PhantomData,
-                        },
-                    ),
-                ),
-            ]),
-            // queue update messages, along with any additional messages to be handled after the clients are created (i.e. connection and channel handshakes)
-            conc(
-                [
-                    repeat(
-                        None,
-                        seq([
-                            event(relay_message::id::<A, B, _>(
-                                a.chain_id(),
-                                relay_message::event::Command::UpdateClient {
-                                    client_id: mk_client_id::<A, B>(next_client_sequence_a),
-                                    __marker: PhantomData,
-                                },
-                            )),
-                            defer_relative(10),
-                        ]),
-                    ),
-                    repeat(
-                        None,
-                        seq([
-                            event(relay_message::id::<B, A, _>(
-                                b.chain_id(),
-                                relay_message::event::Command::UpdateClient {
-                                    client_id: mk_client_id::<B, A>(next_client_sequence_b),
-                                    __marker: PhantomData,
-                                },
-                            )),
-                            defer_relative(10),
-                        ]),
-                    ),
-                ]
-                .into_iter()
-                .chain([msgs]),
-            ),
-        ])
-    };
-
-    let mk_connection_msgs = |client_a_id, client_b_id, connection_ordering| {
-        effect::<RelayMessage>(relay_message::id::<A, B, _>(
-            a.chain_id(),
-            relay_message::effect::MsgConnectionOpenInitData(MsgConnectionOpenInit {
-                client_id: client_a_id,
-                counterparty: connection::counterparty::Counterparty {
-                    client_id: client_b_id,
-                    connection_id: "".to_string().parse().unwrap(),
-                    prefix: MerklePrefix {
-                        // TODO: Make configurable
-                        key_prefix: b"ibc".to_vec(),
-                    },
-                },
-                version: Version {
-                    identifier: "1".into(),
-                    features: connection_ordering,
-                },
-                delay_period: unionlabs::DELAY_PERIOD,
-            }),
-        ))
-    };
-
-    let mk_wait_for_connection_open = |sequence_a: u64, sequence_b: u64| {
-        seq([
-            aggregate(
-                [fetch(relay_message::id::<A, B, _>(
-                    a.chain_id(),
-                    relay_message::fetch::FetchState {
-                        at: QueryHeight::Latest,
-                        path: NextConnectionSequencePath {}.into(),
-                    },
-                ))],
-                [],
-                relay_message::id::<A, B, _>(
-                    a.chain_id(),
-                    AggregateWaitForNextConnectionSequence {
-                        sequence: sequence_a + 1,
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-            aggregate(
-                [fetch(relay_message::id::<B, A, _>(
-                    b.chain_id(),
-                    relay_message::fetch::FetchState {
-                        at: QueryHeight::Latest,
-                        path: NextConnectionSequencePath {}.into(),
-                    },
-                ))],
-                [],
-                relay_message::id::<B, A, _>(
-                    b.chain_id(),
-                    AggregateWaitForNextConnectionSequence {
-                        sequence: sequence_b + 1,
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-            // wait for the connection on chain B to be open, since if B is open then A will also be open
-            aggregate(
-                [fetch(relay_message::id::<B, A, _>(
-                    b.chain_id(),
-                    relay_message::fetch::FetchState {
-                        at: QueryHeight::Latest,
-                        path: ConnectionPath {
-                            connection_id: format!("connection-{}", sequence_b).parse().unwrap(),
-                        }
-                        .into(),
-                    },
-                ))],
-                [],
-                relay_message::id::<B, A, _>(
-                    b.chain_id(),
-                    AggregateWaitForConnectionOpen {
-                        connection_id: format!("connection-{}", sequence_b).parse().unwrap(),
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-        ])
-    };
-
-    let mk_channel_msgs = |connection_a_id, port_a, port_b, channel_ordering, channel_version| {
-        effect::<RelayMessage>(relay_message::id::<A, B, _>(
-            a.chain_id(),
-            relay_message::effect::MsgChannelOpenInitData {
-                msg: MsgChannelOpenInit {
-                    port_id: port_a,
-                    channel: Channel {
-                        state: channel::state::State::Init,
-                        ordering: channel_ordering,
-                        counterparty: channel::counterparty::Counterparty {
-                            port_id: port_b,
-                            channel_id: "".to_string(),
-                        },
-                        connection_hops: vec![connection_a_id],
-                        version: channel_version,
-                    },
-                },
-                __marker: PhantomData,
-            },
-        ))
-    };
-
-    let msgs = match ty {
-        HandshakeType::Client {
-            client_a_config,
-            client_b_config,
-        } => {
-            let (sequence_a, (sequence_b, ())) = get_next_client_sequences().await;
-
-            mk_create_client_msgs(
-                client_a_config,
-                client_b_config,
-                sequence_a.t.state,
-                sequence_b.t.state,
-                Op::Noop,
-            )
-        }
-        HandshakeType::ClientConnection {
-            client_a_config,
-            client_b_config,
-            connection_ordering,
-        } => {
-            let (client_sequence_a, (client_sequence_b, ())) = get_next_client_sequences().await;
-
-            mk_create_client_msgs(
-                client_a_config,
-                client_b_config,
-                client_sequence_a.t.state,
-                client_sequence_b.t.state,
-                mk_connection_msgs(
-                    mk_client_id::<A, B>(client_sequence_a.t.state),
-                    mk_client_id::<B, A>(client_sequence_b.t.state),
-                    connection_ordering,
-                ),
-            )
-        }
-        HandshakeType::ClientConnectionChannel {
-            client_a_config,
-            client_b_config,
-            port_a,
-            port_b,
-            channel_version,
-            connection_ordering,
-            channel_ordering,
-        } => {
-            assert!(connection_ordering.contains(&channel_ordering));
-
-            let (client_sequence_a, (client_sequence_b, ())) = get_next_client_sequences().await;
-            let (connection_sequence_a, (connection_sequence_b, ())) =
-                get_next_connection_sequences().await;
-
-            mk_create_client_msgs(
-                client_a_config,
-                client_b_config,
-                client_sequence_a.t.state,
-                client_sequence_b.t.state,
-                seq([
-                    mk_connection_msgs(
-                        mk_client_id::<A, B>(client_sequence_a.t.state),
-                        mk_client_id::<B, A>(client_sequence_b.t.state),
-                        connection_ordering,
-                    ),
-                    mk_wait_for_connection_open(
-                        connection_sequence_a.t.state,
-                        connection_sequence_b.t.state,
-                    ),
-                    mk_channel_msgs(
-                        format!("connection-{}", connection_sequence_a.t.state)
-                            .parse()
-                            .unwrap(),
-                        port_a,
-                        port_b,
-                        channel_ordering,
-                        channel_version,
-                    ),
-                ]),
-            )
-        }
-        HandshakeType::ConnectionChannel {
-            client_a,
-            client_b,
-            port_a,
-            port_b,
-            channel_version,
-            connection_ordering,
-            channel_ordering,
-        } => {
-            assert!(connection_ordering.contains(&channel_ordering));
-
-            let (connection_sequence_a, (connection_sequence_b, ())) =
-                get_next_connection_sequences().await;
-
-            seq([
-                mk_connection_msgs(
-                    client_a.try_into().unwrap(),
-                    client_b.try_into().unwrap(),
-                    connection_ordering,
-                ),
-                mk_wait_for_connection_open(
-                    connection_sequence_a.t.state,
-                    connection_sequence_b.t.state,
-                ),
-                mk_channel_msgs(
-                    format!("connection-{}", connection_sequence_a.t.state)
-                        .parse()
-                        .unwrap(),
-                    port_a,
-                    port_b,
-                    channel_ordering,
-                    channel_version,
-                ),
-            ])
-        }
-        HandshakeType::Connection {
-            client_a,
-            client_b,
-            connection_ordering,
-        } => mk_connection_msgs(
-            client_a.try_into().unwrap(),
-            client_b.try_into().unwrap(),
-            connection_ordering,
-        ),
-        HandshakeType::Channel {
-            connection_a,
-            port_a,
-            port_b,
-            channel_version,
-            channel_ordering,
-        } => mk_channel_msgs(
-            connection_a,
-            port_a,
-            port_b,
-            channel_ordering,
-            channel_version,
-        ),
-    };
-
-    VoyagerMessage::from_op(msgs)
-}
-
-async fn mk_init_fetch<A>(a: &A) -> Op<VoyagerMessage>
-where
-    A: block_message::ChainExt,
-    block_message::AnyChainIdentified<block_message::fetch::AnyFetch>:
-        From<block_message::Identified<A, block_message::fetch::Fetch<A>>>,
-{
-    fetch(VoyagerFetch::Block(
-        block_message::id::<A, _>(
-            a.chain_id(),
-            block_message::fetch::FetchBlock::<A> {
-                height: a.query_latest_height().await.unwrap(),
-            },
-        )
-        .into(),
-    ))
-}
-
-fn mk_client_id<Hc: LightClientType<Tr>, Tr: Chain>(sequence: u64) -> ClientIdOf<Hc> {
-    format!(
-        "{}-{}",
-        <Hc as LightClientType<Tr>>::TYPE.identifier_prefix(),
-        sequence
-    )
-    .parse()
-    .unwrap()
-}
-
-// #[tokio::test]
-// async fn size() {
-//     tracing_subscriber::fmt()
-//         .with_env_filter(EnvFilter::from_default_env())
-//         .init();
-
-//     // dbg!(mem::size_of::<QueueMsg<VoyagerMessageTypes>>());
-
-//     let msg: QueueMsg<VoyagerMessageTypes> =
-//         seq([seq([seq([seq([seq([seq([seq([seq([seq([seq(
-//             [seq([seq([seq([seq([seq([queue_msg::noop()])])])])])],
-//         )])])])])])])])])]);
-
-//     msg.handle(&chains_from_config(Default::default()).await.unwrap(), 0)
-//         .await
-//         .unwrap();
-// }

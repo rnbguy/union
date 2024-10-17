@@ -1,20 +1,33 @@
-{ ... }: {
-  perSystem = { pkgs, unstablePkgs, lib, ensureAtRepositoryRoot, ... }:
+_: {
+  perSystem =
+    {
+      pkgs,
+      unstablePkgs,
+      lib,
+      ensureAtRepositoryRoot,
+      ...
+    }:
     let
-      pkgsDeps = with pkgs; [ pkg-config python3 ];
-      nodeDeps = with unstablePkgs; [ nodePackages_latest.nodejs ];
+      pkgsDeps = with pkgs; [
+        pkg-config
+        python3
+      ];
+      nodeDeps = with unstablePkgs; [
+        nodePackages_latest.nodejs
+        nodePackages_latest."patch-package"
+      ];
       combinedDeps = pkgsDeps ++ nodeDeps;
       packageJSON = lib.importJSON ./package.json;
     in
     {
       packages = {
         app = unstablePkgs.buildNpmPackage {
-          npmDepsHash = "sha256-5mltk0PZ38RXJ8iGLxTiLu+o7mQ9HwQXRcVbRzTYMyA=";
+          npmDepsHash = "sha256-DD7rjuzM5RSfubkK8hNH3qKAmEf3oy1e7hyR3gi9Kb0=";
           src = ./.;
           sourceRoot = "app";
-          npmFlags = [ "--legacy-peer-deps" ];
+          npmFlags = [ "--enable-pre-post-scripts" ];
           pname = packageJSON.name;
-          version = packageJSON.version;
+          inherit (packageJSON) version;
           nativeBuildInputs = combinedDeps;
           buildInputs = combinedDeps;
           installPhase = ''
@@ -52,6 +65,20 @@
               npx gql.tada generate-schema --tsconfig ./tsconfig.json --output "./src/generated/schema.graphql" "https://blue.graphql.union.build/v1/graphql"
 
               npx gql.tada generate-output --disable-preprocessing --tsconfig ./tsconfig.json --output ./src/generated/graphql-env.d.ts
+            '';
+          };
+        };
+        deploy-app-ipfs = {
+          type = "app";
+          program = pkgs.writeShellApplication {
+            name = "deploy-app-ipfs";
+            runtimeInputs = combinedDeps;
+            text = ''
+              ${ensureAtRepositoryRoot}
+              cd app/
+
+              nix build .#app
+              npm_config_yes=true npx @fleek-platform/cli sites deploy
             '';
           };
         };

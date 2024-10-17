@@ -1,50 +1,50 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use chain_utils::{AnyChain, AnyChainTryFromConfigError, ChainConfigType};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use voyager_message::context::{ModulesConfig, PluginConfig};
 
-use crate::{passes::tx_batch::TxBatch, queue::AnyQueueConfig};
+use crate::queue::QueueConfig;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "", deserialize = ""), deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Map of chain name to it's respective config.
-    pub chain: BTreeMap<String, ChainConfig>,
+    // allows for using $schema in the config file
+    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub modules: ModulesConfig,
+    pub plugins: Vec<PluginConfig>,
     pub voyager: VoyagerConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct VoyagerConfig {
     pub num_workers: u16,
-    pub laddr: SocketAddr,
-    pub queue: AnyQueueConfig,
-    pub tx_batch: TxBatch,
-    #[serde(default)]
+    #[serde(default = "default_rest_laddr")]
+    pub rest_laddr: SocketAddr,
+    #[serde(default = "default_rpc_laddr")]
+    pub rpc_laddr: SocketAddr,
+    pub queue: QueueConfig,
+    // TODO: Specify per plugin
+    #[serde(default = "default_optimizer_delay_milliseconds")]
     pub optimizer_delay_milliseconds: u64,
 }
 
-impl Config {
-    pub async fn get_chain(&self, name: &str) -> Result<AnyChain, GetChainError> {
-        match self.chain.get(name) {
-            Some(config) => Ok(AnyChain::try_from_config(config.ty.clone()).await?),
-            None => Err(GetChainError::ChainNotFound {
-                name: name.to_string(),
-            }),
-        }
-    }
+#[must_use]
+#[inline]
+pub const fn default_rest_laddr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 7177)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum GetChainError {
-    #[error("chain `{name}` not found in config")]
-    ChainNotFound { name: String },
-    #[error("error initializing chain")]
-    AnyChainTryFromConfig(#[from] AnyChainTryFromConfigError),
+#[must_use]
+#[inline]
+pub const fn default_rpc_laddr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 7178)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainConfig {
-    pub enabled: bool,
-    #[serde(flatten)]
-    pub ty: ChainConfigType,
+#[must_use]
+#[inline]
+pub const fn default_optimizer_delay_milliseconds() -> u64 {
+    100
 }

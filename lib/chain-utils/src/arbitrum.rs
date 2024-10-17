@@ -5,33 +5,30 @@ use ethers::{
     contract::{EthAbiCodec, EthAbiType, EthDisplay, EthEvent},
     providers::{Middleware, Provider, ProviderError, Ws, WsClientError},
 };
-use futures::TryFutureExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 use unionlabs::{
     bounded::BoundedU32,
-    encoding::EthAbi,
-    ethereum::config::Mainnet,
     google::protobuf::any::Any,
     hash::{H160, H256},
     ibc::{
         core::client::height::Height,
-        lightclients::{arbitrum, ethereum::storage_proof::StorageProof},
+        lightclients::{
+            arbitrum,
+            ethereum::{self, storage_proof::StorageProof},
+        },
     },
-    id::ClientId,
-    traits::{Chain, ChainIdOf, ClientIdOf, FromStrExact},
     uint::U256,
+    validated::ValidateT,
 };
 
 use crate::{
     ethereum::{
-        self, balance_of_signers, get_proof, AnyEthereum, AnyEthereumError, Ethereum,
-        EthereumConsensusChain, EthereumIbcChain, EthereumKeyring, EthereumSignerMiddleware,
-        EthereumSignersConfig, ReadWrite, Readonly,
+        balance_of_signers, AnyEthereum, AnyEthereumError, EthereumConsensusChain,
+        EthereumIbcChain, EthereumKeyring, EthereumSignerMiddleware, EthereumSignersConfig,
+        ReadWrite, Readonly,
     },
     keyring::{ChainKeyring, ConcurrentKeyring, KeyringConfig, SignerBalance},
-    union::Union,
-    wasm::Wasm,
 };
 
 pub const ARBITRUM_REVISION_NUMBER: u64 = 0;
@@ -54,7 +51,7 @@ pub struct Arbitrum {
     pub l1_nodes_slot: U256,
     pub l1_nodes_confirm_data_offset: U256,
 
-    pub l1_client_id: ClientIdOf<Ethereum<Mainnet>>,
+    pub l1_client_id: U256,
     /// GRPC url of Union, used to query the L1 state with [`Self::l1_client_id`].
     pub union_grpc_url: String,
 }
@@ -79,8 +76,8 @@ pub struct Config {
     pub l1_nodes_confirm_data_offset: U256,
     pub l1_next_node_num_slot_offset_bytes: BoundedU32<0, 24>,
 
-    pub l1_client_id: ClientIdOf<Ethereum<Mainnet>>,
-    pub l1: ethereum::Config<Readonly>,
+    pub l1_client_id: U256,
+    pub l1: crate::ethereum::Config<Readonly>,
 
     pub union_grpc_url: String,
 }
@@ -202,7 +199,7 @@ impl EthereumConsensusChain for Arbitrum {
                     .select(
                         ethers::types::BlockNumber::Earliest..ethers::types::BlockNumber::Latest,
                     )
-                    .address(ethers::types::H160(self.l1_contract_address.0))
+                    .address(ethers::types::H160(*self.l1_contract_address.get()))
                     .topic0(NodeCreated::signature())
                     .topic1(ethers::types::H256(U256::from(next_node_num).to_be_bytes())),
             )
@@ -219,7 +216,7 @@ impl EthereumConsensusChain for Arbitrum {
         let block = self
             .provider
             .get_block(ethers::types::H256(
-                event.assertion.after_state.global_state.bytes32_vals[0].0,
+                *event.assertion.after_state.global_state.bytes32_vals[0].get(),
             ))
             .await
             .unwrap()
@@ -228,8 +225,9 @@ impl EthereumConsensusChain for Arbitrum {
         block.number.unwrap().0[0]
     }
 
-    async fn get_proof(&self, address: H160, location: U256, block: u64) -> StorageProof {
-        get_proof(self, address, location, block).await
+    async fn get_proof(&self, _address: H160, _location: U256, _block: u64) -> StorageProof {
+        todo!()
+        // get_proof(self, address, location, block).await
     }
 }
 
@@ -302,39 +300,10 @@ pub struct GlobalState {
     pub u64_vals: [u64; 2],
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct ArbitrumChainType;
-impl FromStrExact for ArbitrumChainType {
-    const EXPECTING: &'static str = "arbitrum";
-}
-
-impl Chain for Arbitrum {
-    type ChainType = ArbitrumChainType;
-
-    type SelfClientState = arbitrum::client_state::ClientState;
-    type SelfConsensusState = arbitrum::consensus_state::ConsensusState;
-    type Header = arbitrum::header::Header;
-
-    type StoredClientState<Tr: Chain> = Tr::SelfClientState;
-    type StoredConsensusState<Tr: Chain> = Tr::SelfConsensusState;
-
-    type Height = Height;
-
-    type ClientId = ClientId;
-
-    type IbcStateEncoding = EthAbi;
-
-    type StateProof = StorageProof;
-
-    type ClientType = String;
-
-    type Error = Box<dyn std::error::Error + Send + Sync>;
-
-    fn chain_id(&self) -> ChainIdOf<Self> {
-        self.chain_id
-    }
-
-    async fn query_latest_height(&self) -> Result<Self::Height, Self::Error> {
+impl Arbitrum {
+    pub async fn query_latest_height(
+        &self,
+    ) -> Result<Height, Box<dyn core::error::Error + Send + Sync>> {
         // the latest height of arbitrum is the latest height of the l1 light client on union
 
         let l1_client_state = protos::ibc::core::client::v1::query_client::QueryClient::connect(
@@ -350,32 +319,37 @@ impl Chain for Arbitrum {
         .ok_or("client state missing???")?;
 
         // don't worry about it
-        let Any(l1_client_state) =
-            <<Wasm<Union> as Chain>::StoredClientState<Ethereum<Mainnet>>>::try_from(
-                l1_client_state,
-            )
-            .unwrap();
+        let Any(_l1_client_state) = <Any<
+            unionlabs::ibc::lightclients::wasm::client_state::ClientState<
+                ethereum::client_state::ClientState,
+            >,
+        >>::try_from(l1_client_state)
+        .unwrap();
 
-        Ok(match &self.l1 {
-            AnyEthereum::Mainnet(eth) => eth.make_height(l1_client_state.data.latest_slot),
-            AnyEthereum::Minimal(eth) => eth.make_height(l1_client_state.data.latest_slot),
-        })
-    }
+        // Ok(match &self.l1 {
+        //     AnyEthereum::Mainnet(eth) => eth.make_height(l1_client_state.data.latest_slot),
+        //     AnyEthereum::Minimal(eth) => eth.make_height(l1_client_state.data.latest_slot),
+        // })
 
-    async fn query_latest_height_as_destination(&self) -> Result<Self::Height, Self::Error> {
         todo!()
     }
 
-    async fn query_latest_timestamp(&self) -> Result<i64, Self::Error> {
-        match &self.l1 {
-            AnyEthereum::Mainnet(eth) => eth.query_latest_timestamp().map_err(Into::into).await,
-            AnyEthereum::Minimal(eth) => eth.query_latest_timestamp().map_err(Into::into).await,
-        }
-    }
+    // async fn query_latest_height_as_destination(&self) -> Result<Self::Height, Self::Error> {
+    //     todo!()
+    // }
 
-    async fn self_client_state(&self, height: Self::Height) -> Self::SelfClientState {
+    // pub async fn query_latest_timestamp(
+    //     &self,
+    // ) -> Result<i64, Box<dyn core::error::Error + Send + Sync>> {
+    //     match &self.l1 {
+    //         AnyEthereum::Mainnet(eth) => eth.query_latest_timestamp().map_err(Into::into).await,
+    //         AnyEthereum::Minimal(eth) => eth.query_latest_timestamp().map_err(Into::into).await,
+    //     }
+    // }
+
+    pub async fn self_client_state(&self, height: Height) -> arbitrum::client_state::ClientState {
         arbitrum::client_state::ClientState {
-            l1_client_id: self.l1_client_id.clone(),
+            l1_client_id: self.l1_client_id.clone().to_string().validate().unwrap(),
             chain_id: self.chain_id,
             l1_latest_slot: height.revision_height,
             l1_contract_address: self.l1_contract_address,
@@ -392,7 +366,10 @@ impl Chain for Arbitrum {
         }
     }
 
-    async fn self_consensus_state(&self, height: Self::Height) -> Self::SelfConsensusState {
+    pub async fn self_consensus_state(
+        &self,
+        height: Height,
+    ) -> arbitrum::consensus_state::ConsensusState {
         let arbitrum_height = ethers::types::BlockId::Number(ethers::types::BlockNumber::Number(
             self.execution_height_of_beacon_slot(height.revision_height)
                 .await
@@ -402,7 +379,7 @@ impl Chain for Arbitrum {
         let storage_root = self
             .provider
             .get_storage_at(
-                ethers::types::H160(self.l1_contract_address.0),
+                ethers::types::H160(*self.l1_contract_address.get()),
                 H256::from(self.ibc_commitment_slot.to_be_bytes()).into(),
                 Some(arbitrum_height),
             )

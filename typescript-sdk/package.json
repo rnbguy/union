@@ -1,59 +1,67 @@
 {
-  "name": "@union/client",
-  "version": "0.0.1-rc.53",
+  "name": "@unionlabs/client",
+  "version": "0.0.26",
+  "homepage": "https://union.build",
   "description": "Union Labs cross-chain transfers client",
-  "homepage": "https://jsr.io/@union/client",
   "type": "module",
-  "exports": "./src/mod.ts",
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "default": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "LICENSE", "README.md", "package.json"],
   "scripts": {
-    "build": "echo 'No need… jsr.io requires no build step'",
+    "build": "tsup --config='tsup.config.ts'",
     "typecheck": "tsc --project tsconfig.json --noEmit",
-    "publish": "bun ./scripts/publish.ts",
-    "publish-dry-run": "DRY_RUN=1 bun ./scripts/publish.ts",
-    "faucet": "bun ./playground/faucet.ts",
-    "balance": "bun ./playground/balance.ts",
-    "transfer": "bun ./playground/transfer.ts",
+    "publish-jsr": "bun ./scripts/publish.ts",
+    "publish-jsr-dry-run": "DRY_RUN=1 bun ./scripts/publish.ts",
     "test": "vitest --run",
     "test:typecheck": "vitest --typecheck.only",
+    "check-package": "bunx publint@latest --strict && bunx @arethetypeswrong/cli --pack --ignore-rules 'cjs-resolves-to-esm'",
     "clean": "rm -rf dist node_modules",
-    "postinstall": "patch-package"
-  },
-  "imports": {
-    "#*": "./src/*"
+    "postinstall": "patch-package",
+    "prepublish": "bun run build"
   },
   "dependencies": {
+    "@cosmjs/tendermint-rpc": "^0.32.4",
     "@cosmjs/cosmwasm-stargate": "0.32.4",
+    "@cosmjs/proto-signing": "^0.32.4",
     "@cosmjs/stargate": "0.32.4",
+    "@cosmjs/amino": "^0.32.4",
+    "@scure/base": "^1.1.8",
+    "patch-package": "^8.0.0",
+    "neverthrow": "^8.0.0",
     "ofetch": "^1.3.4",
-    "viem": "^2.19.3"
+    "viem": "^2.21.8"
   },
   "devDependencies": {
-    "@cosmjs/tendermint-rpc": "^0.32.4",
-    "@cosmjs/proto-signing": "^0.32.4",
-    "@arethetypeswrong/cli": "^0.15.4",
-    "@cosmjs/amino": "0.32.4",
-    "@scure/base": "^1.1.7",
-    "@total-typescript/ts-reset": "^0.5.1",
-    "@types/bun": "^1.1.6",
-    "@types/node": "^22.2.0",
+    "@total-typescript/ts-reset": "^0.6.1",
+    "@types/bun": "^1.1.9",
+    "@types/node": "^22.5.5",
     "consola": "^3.2.3",
     "cosmjs-types": "^0.9.0",
-    "jsr": "^0.13.1",
-    "patch-package": "^8.0.0",
-    "tsx": "^4.17.0",
-    "typescript": "^5.5.4",
+    "jsr": "^0.13.2",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
     "vite-tsconfig-paths": "^5.0.1",
-    "vitest": "^2.0.5"
-  },
-  "overrides": {
-    "globalthis": "npm:@nolyfill/globalthis@^1",
-    "json-stable-stringify": "npm:@nolyfill/json-stable-stringify@^1"
+    "vitest": "^2.1.1"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/unionlabs/union.git",
+    "url": "git+https://github.com/unionlabs/union.git",
     "directory": "typescript-sdk"
   },
+  "license": "MIT",
   "engineStrict": true,
-  "sideEffects": false
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  }
 }

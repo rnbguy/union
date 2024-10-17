@@ -1,1235 +1,550 @@
-#![feature(min_exhaustive_patterns)]
-#![allow(clippy::large_enum_variant)]
-#![warn(clippy::large_futures)]
+#![feature(trait_alias)]
 
-use std::{collections::VecDeque, fmt::Debug, str::FromStr};
+use std::{env::VarError, fmt::Debug, future::Future, time::Duration};
 
-use block_message::BlockMessage;
-use chain_utils::{
-    arbitrum::Arbitrum, berachain::Berachain, cosmos::Cosmos, ethereum::Ethereum, scroll::Scroll,
-    union::Union, wasm::Wasm, Chains,
-};
-use futures::TryFutureExt;
-use queue_msg::{
-    event, noop, queue_msg, HandleAggregate, HandleData, HandleEffect, HandleEvent, HandleFetch,
-    HandleWait, Op, QueueError, QueueMessage,
-};
-use relay_message::{AnyLightClientIdentified, RelayMessage};
-use tracing::{info_span, Instrument};
-use unionlabs::{
-    ethereum::config::{Mainnet, Minimal},
-    events::{
-        AcknowledgePacket, ChannelOpenAck, ChannelOpenConfirm, ChannelOpenInit, ChannelOpenTry,
-        ClientMisbehaviour, ConnectionOpenAck, ConnectionOpenConfirm, ConnectionOpenInit,
-        ConnectionOpenTry, CreateClient, IbcEvent, RecvPacket, SendPacket, SubmitEvidence,
-        TimeoutPacket, UpdateClient, WriteAcknowledgement,
+use chain_utils::BoxDynError;
+use jsonrpsee::{
+    core::{client::BatchResponse, params::BatchRequestBuilder, traits::ToRpcParams, RpcResult},
+    server::middleware::rpc::RpcServiceT,
+    types::{
+        error::{INVALID_PARAMS_CODE, METHOD_NOT_FOUND_CODE},
+        ErrorObject,
     },
-    traits::{ChainIdOf, ClientIdOf, ClientTypeOf, HeightOf},
-    ClientType, WasmClientType,
+    Extensions, RpcModule,
 };
+use macros::model;
+use reth_ipc::{client::IpcClientBuilder, server::RpcServiceBuilder};
+use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
+use tonic::async_trait;
+use tracing::{debug, debug_span, error, info, trace, Instrument};
+use unionlabs::{traits::Member, ErrorReporter};
+use voyager_vm::{QueueError, QueueMessage};
+
+use crate::{
+    call::Call,
+    callback::Callback,
+    context::{Context, INVALID_CONFIG_EXIT_CODE, STARTUP_ERROR_EXIT_CODE},
+    data::Data,
+    filter::JaqInterestFilter,
+    module::{
+        ChainModuleInfo, ChainModuleServer, ClientModuleInfo, ClientModuleServer,
+        ConsensusModuleInfo, ConsensusModuleServer, PluginInfo, PluginServer,
+    },
+};
+
+pub mod call;
+pub mod callback;
+pub mod data;
+
+pub mod context;
+pub mod filter;
+pub mod module;
+pub mod pass;
+
+pub mod hook;
+
+pub mod rpc;
+
+pub use reconnecting_jsonrpc_ws_client;
+pub use reth_ipc;
+pub use voyager_core as core;
 
 pub enum VoyagerMessage {}
 
 impl QueueMessage for VoyagerMessage {
-    type Event = VoyagerEvent;
-    type Data = VoyagerData;
-    type Fetch = VoyagerFetch;
-    type Effect = VoyagerEffect;
-    type Wait = VoyagerWait;
-    type Aggregate = VoyagerAggregate;
+    type Call = Call;
+    type Data = Data;
+    type Callback = Callback;
 
-    type Store = Chains;
+    type Filter = JaqInterestFilter;
+
+    type Context = Context;
 }
 
-pub trait FromOp<T: QueueMessage>: QueueMessage + Sized {
-    fn from_op(value: Op<T>) -> Op<Self>;
-}
+/// Error code for fatal errors. If a plugin or module responds with this error
+/// code, it will be treated as failed and not retried.
+pub const FATAL_JSONRPC_ERROR_CODE: i32 = -0xBADBEEF;
 
-impl FromOp<RelayMessage> for VoyagerMessage {
-    fn from_op(value: Op<RelayMessage>) -> Op<Self> {
-        match value {
-            Op::Event(event) => Op::Event(VoyagerEvent::Relay(event)),
-            Op::Data(data) => Op::Data(VoyagerData::Relay(data)),
-            Op::Fetch(fetch) => Op::Fetch(VoyagerFetch::Relay(fetch)),
-            Op::Effect(msg) => Op::Effect(VoyagerEffect::Relay(msg)),
-            Op::Wait(wait) => Op::Wait(VoyagerWait::Relay(wait)),
-            Op::Defer(defer) => Op::Defer(defer),
-            Op::Repeat { times, msg } => Op::Repeat {
-                times,
-                msg: Box::new(Self::from_op(*msg)),
-            },
-            Op::Timeout {
-                timeout_timestamp,
-                msg,
-            } => Op::Timeout {
-                timeout_timestamp,
-                msg: Box::new(Self::from_op(*msg)),
-            },
-            Op::Seq(seq) => Op::Seq(seq.into_iter().map(Self::from_op).collect()),
-            Op::Conc(seq) => Op::Conc(seq.into_iter().map(Self::from_op).collect()),
-            Op::Retry { remaining, msg } => Op::Retry {
-                remaining,
-                msg: Box::new(Self::from_op(*msg)),
-            },
-            Op::Aggregate {
-                queue,
-                data,
-                receiver,
-            } => Op::Aggregate {
-                queue: queue.into_iter().map(Self::from_op).collect(),
-                data: data.into_iter().map(VoyagerData::Relay).collect(),
-                receiver: VoyagerAggregate::Relay(receiver),
-            },
-            Op::Race(seq) => Op::Race(seq.into_iter().map(Self::from_op).collect()),
-            Op::Void(msg) => Op::Void(Box::new(Self::from_op(*msg))),
-            Op::Noop => noop(),
-        }
+/// Convert a [`jsonrpsee::core::client::Error`] to a `voyager-vm`
+/// [`QueueError`].
+///
+/// All errors are treated as retryable, unless `error` is a `Call` variant and
+/// the contained [`ErrorObject`] is deemed to be fatal. See
+/// [`error_object_to_queue_error`] for more information on the conversion from
+/// [`ErrorObject`] to [`QueueError`].
+pub fn json_rpc_error_to_queue_error(error: jsonrpsee::core::client::Error) -> QueueError {
+    match error {
+        jsonrpsee::core::client::Error::Call(error) => error_object_to_queue_error(error),
+        value => QueueError::Retry(Box::new(value)),
     }
 }
 
-impl FromOp<BlockMessage> for VoyagerMessage {
-    fn from_op(value: Op<BlockMessage>) -> Op<Self> {
-        match value {
-            Op::Data(data) => Op::Data(VoyagerData::Block(data)),
-            Op::Fetch(fetch) => Op::Fetch(VoyagerFetch::Block(fetch)),
-            Op::Wait(wait) => Op::Wait(VoyagerWait::Block(wait)),
-            Op::Defer(defer) => Op::Defer(defer),
-            Op::Repeat { times, msg } => Op::Repeat {
-                times,
-                msg: Box::new(Self::from_op(*msg)),
-            },
-            Op::Timeout {
-                timeout_timestamp,
-                msg,
-            } => Op::Timeout {
-                timeout_timestamp,
-                msg: Box::new(Self::from_op(*msg)),
-            },
-            Op::Seq(seq) => Op::Seq(seq.into_iter().map(Self::from_op).collect()),
-            Op::Conc(seq) => Op::Conc(seq.into_iter().map(Self::from_op).collect()),
-            Op::Race(seq) => Op::Race(seq.into_iter().map(Self::from_op).collect()),
-            Op::Retry { remaining, msg } => Op::Retry {
-                remaining,
-                msg: Box::new(Self::from_op(*msg)),
-            },
-            Op::Aggregate {
-                queue,
-                data,
-                receiver,
-            } => Op::Aggregate {
-                queue: queue.into_iter().map(Self::from_op).collect(),
-                data: data.into_iter().map(VoyagerData::Block).collect(),
-                receiver: VoyagerAggregate::Block(receiver),
-            },
-            Op::Void(msg) => Op::Void(Box::new(Self::from_op(*msg))),
-            Op::Noop => noop(),
-        }
-    }
-}
-
-#[queue_msg]
-pub enum VoyagerEffect {
-    Block(<BlockMessage as QueueMessage>::Effect),
-    Relay(<RelayMessage as QueueMessage>::Effect),
-}
-
-impl HandleEffect<VoyagerMessage> for VoyagerEffect {
-    async fn handle(
-        self,
-        store: &<VoyagerMessage as QueueMessage>::Store,
-    ) -> Result<Op<VoyagerMessage>, QueueError> {
-        Ok(match self {
-            Self::Relay(msg) => {
-                Box::pin(msg.handle(store))
-                    .map_ok(VoyagerMessage::from_op)
-                    .instrument(info_span!("relay"))
-                    .await?
-            }
-        })
-    }
-}
-
-#[queue_msg]
-pub enum VoyagerWait {
-    Block(<BlockMessage as QueueMessage>::Wait),
-    Relay(<RelayMessage as QueueMessage>::Wait),
-}
-
-impl HandleWait<VoyagerMessage> for VoyagerWait {
-    async fn handle(
-        self,
-        store: &<VoyagerMessage as QueueMessage>::Store,
-    ) -> Result<Op<VoyagerMessage>, QueueError> {
-        Ok(match self {
-            Self::Block(msg) => {
-                Box::pin(HandleWait::<BlockMessage>::handle(msg, store))
-                    .map_ok(VoyagerMessage::from_op)
-                    .instrument(info_span!("block"))
-                    .await?
-            }
-            Self::Relay(msg) => {
-                Box::pin(HandleWait::<RelayMessage>::handle(msg, store))
-                    .map_ok(VoyagerMessage::from_op)
-                    .instrument(info_span!("relay"))
-                    .await?
-            }
-        })
-    }
-}
-
-#[queue_msg]
-pub enum VoyagerAggregate {
-    Block(<BlockMessage as QueueMessage>::Aggregate),
-    Relay(<RelayMessage as QueueMessage>::Aggregate),
-}
-
-impl HandleAggregate<VoyagerMessage> for VoyagerAggregate {
-    fn handle(
-        self,
-        data: VecDeque<<VoyagerMessage as QueueMessage>::Data>,
-    ) -> Result<Op<VoyagerMessage>, QueueError> {
-        match self {
-            Self::Block(aggregate) => {
-                let _span = info_span!("block").entered();
-                aggregate
-                    .handle(
-                        data.into_iter()
-                            .map(|d| match d {
-                                VoyagerData::Block(d) => d,
-                                VoyagerData::Relay(_) => {
-                                    panic!("found relay message in data of block message aggregate")
-                                }
-                            })
-                            .collect(),
-                    )
-                    .map(VoyagerMessage::from_op)
-            }
-            Self::Relay(aggregate) => {
-                let _span = info_span!("relay").entered();
-                aggregate
-                    .handle(
-                        data.into_iter()
-                            .map(|d| match d {
-                                VoyagerData::Block(_) => {
-                                    panic!("found block message in data of relay message aggregate")
-                                }
-                                VoyagerData::Relay(d) => d,
-                            })
-                            .collect(),
-                    )
-                    .map(VoyagerMessage::from_op)
-            }
-        }
-    }
-}
-
-#[queue_msg]
-pub enum VoyagerEvent {
-    Block(<BlockMessage as QueueMessage>::Event),
-    Relay(<RelayMessage as QueueMessage>::Event),
-}
-
-impl HandleEvent<VoyagerMessage> for VoyagerEvent {
-    fn handle(
-        self,
-        store: &<VoyagerMessage as QueueMessage>::Store,
-    ) -> Result<Op<VoyagerMessage>, QueueError> {
-        match self {
-            Self::Relay(event) => {
-                let _span = info_span!("relay").entered();
-                HandleEvent::handle(event, store).map(VoyagerMessage::from_op)
-            }
-        }
-    }
-}
-
-#[queue_msg]
-pub enum VoyagerData {
-    Block(<BlockMessage as QueueMessage>::Data),
-    Relay(<RelayMessage as QueueMessage>::Data),
-}
-
-impl HandleData<VoyagerMessage> for VoyagerData {
-    fn handle(
-        self,
-        store: &<VoyagerMessage as QueueMessage>::Store,
-    ) -> Result<Op<VoyagerMessage>, QueueError> {
-        Ok(match self {
-            Self::Block(data) => {
-                macro_rules! block_data_to_relay_event {
-                    ($($Variant:ident => {$(
-                        $ClientType:pat => ($Hc:ty, $BlockHc:ty, $Tr:ty),
-                    )*})*) => {
-                        match data.handle(store)? {
-                            $(Op::Data(block_message::AnyChainIdentified::$Variant(
-                                block_message::Identified {
-                                    chain_id,
-                                    t: block_message::data::Data::IbcEvent(ibc_event),
-                                },
-                            )) => <VoyagerMessage as FromOp<RelayMessage>>::from_op(
-                                match ibc_event.client_type {
-                                    $($ClientType => {
-                                        mk_relay_event::<$Hc, $BlockHc, $Tr>(chain_id, ibc_event)
-                                    })*
-                                    _ => unimplemented!(),
-                                },
-                            ),)*
-                            msg => VoyagerMessage::from_op(msg),
-                        }
-                    };
-                }
-
-                let _span = info_span!("block").entered();
-
-                block_data_to_relay_event!(
-                    Cosmos => {
-                        ClientType::Wasm(WasmClientType::Cometbls)        => (Wasm<Cosmos>, Cosmos, Union),
-                        ClientType::Tendermint                            => (Cosmos, Cosmos, Cosmos),
-                        ClientType::_11Cometbls                           => (Cosmos, Cosmos, Union),
-                    }
-                    Union => {
-                        ClientType::Wasm(WasmClientType::EthereumMinimal) => (Wasm<Union>, Union, Ethereum<Minimal>),
-                        ClientType::Wasm(WasmClientType::EthereumMainnet) => (Wasm<Union>, Union, Ethereum<Mainnet>),
-                        ClientType::Wasm(WasmClientType::Scroll)          => (Wasm<Union>, Union, Scroll),
-                        ClientType::Wasm(WasmClientType::Arbitrum)        => (Wasm<Union>, Union, Arbitrum),
-                        ClientType::Wasm(WasmClientType::Berachain)       => (Wasm<Union>, Union, Berachain),
-                        ClientType::Tendermint                            => (Union, Union, Wasm<Cosmos>),
-                    }
-                    EthMainnet => {
-                        ClientType::Cometbls                              => (Ethereum<Mainnet>, Ethereum<Mainnet>, Wasm<Union>),
-                    }
-                    EthMinimal => {
-                        ClientType::Cometbls                              => (Ethereum<Minimal>, Ethereum<Minimal>, Wasm<Union>),
-                    }
-                    Scroll => {
-                        ClientType::Cometbls                              => (Scroll, Scroll, Wasm<Union>),
-                    }
-                    Arbitrum => {
-                        ClientType::Cometbls                              => (Arbitrum, Arbitrum, Wasm<Union>),
-                    }
-                    Berachain => {
-                        ClientType::Cometbls                              => (Berachain, Berachain, Wasm<Union>),
-                    }
-                )
-            }
-            Self::Relay(data) => {
-                let _span = info_span!("relay").entered();
-                VoyagerMessage::from_op(data.handle(store)?)
-            }
-        })
-    }
-}
-
-#[queue_msg]
-pub enum VoyagerFetch {
-    Block(<BlockMessage as QueueMessage>::Fetch),
-    Relay(<RelayMessage as QueueMessage>::Fetch),
-}
-
-impl HandleFetch<VoyagerMessage> for VoyagerFetch {
-    async fn handle(
-        self,
-        store: &<VoyagerMessage as QueueMessage>::Store,
-    ) -> Result<Op<VoyagerMessage>, QueueError> {
-        match self {
-            Self::Block(fetch) => {
-                fetch
-                    .handle(store)
-                    .map_ok(VoyagerMessage::from_op)
-                    .instrument(info_span!("block"))
-                    .await
-            }
-            Self::Relay(fetch) => {
-                Box::pin(fetch.handle(store))
-                    .map_ok(VoyagerMessage::from_op)
-                    .instrument(info_span!("relay"))
-                    .await
-            }
-        }
-    }
-}
-
-fn mk_relay_event<Hc, BlockHc, Tr>(
-    chain_id: ChainIdOf<Hc>,
-    ibc_event: block_message::data::ChainEvent<BlockHc>,
-) -> Op<RelayMessage>
-where
-    Hc: relay_message::ChainExt<
-        Height = HeightOf<BlockHc>,
-        ClientId = ClientIdOf<BlockHc>,
-        ClientType = ClientTypeOf<BlockHc>,
-    >,
-    BlockHc: block_message::ChainExt,
-    Tr: relay_message::ChainExt<ClientId: FromStr<Err: Debug>>,
-
-    AnyLightClientIdentified<relay_message::event::AnyEvent>:
-        From<relay_message::Identified<Hc, Tr, relay_message::event::Event<Hc, Tr>>>,
-{
-    event::<RelayMessage>(relay_message::id::<Hc, Tr, _>(
-        chain_id,
-        relay_message::event::IbcEvent {
-            tx_hash: ibc_event.tx_hash,
-            height: ibc_event.height,
-            event: chain_event_to_lc_event::<Hc, Tr>(ibc_event.event),
-        },
-    ))
-}
-
-// poor man's monad
-fn chain_event_to_lc_event<Hc, Tr>(
-    event: IbcEvent<Hc::ClientId, Hc::ClientType, String>,
-) -> IbcEvent<Hc::ClientId, Hc::ClientType, Tr::ClientId>
-where
-    Hc: relay_message::ChainExt,
-    Tr: relay_message::ChainExt<ClientId: FromStr<Err: Debug>>,
-{
-    match event {
-        IbcEvent::CreateClient(CreateClient {
-            client_id,
-            client_type,
-            consensus_height,
-        }) => IbcEvent::CreateClient(CreateClient {
-            client_id,
-            client_type,
-            consensus_height,
-        }),
-        IbcEvent::UpdateClient(UpdateClient {
-            client_id,
-            client_type,
-            consensus_heights,
-        }) => IbcEvent::UpdateClient(UpdateClient {
-            client_id,
-            client_type,
-            consensus_heights,
-        }),
-        IbcEvent::ClientMisbehaviour(ClientMisbehaviour {
-            client_id,
-            client_type,
-            consensus_height,
-        }) => IbcEvent::ClientMisbehaviour(ClientMisbehaviour {
-            client_id,
-            client_type,
-            consensus_height,
-        }),
-        IbcEvent::SubmitEvidence(SubmitEvidence { evidence_hash }) => {
-            IbcEvent::SubmitEvidence(SubmitEvidence { evidence_hash })
-        }
-        IbcEvent::ConnectionOpenInit(ConnectionOpenInit {
-            connection_id,
-            client_id,
-            counterparty_client_id,
-        }) => IbcEvent::ConnectionOpenInit(ConnectionOpenInit {
-            connection_id,
-            client_id,
-            counterparty_client_id: counterparty_client_id.parse().unwrap(),
-        }),
-        IbcEvent::ConnectionOpenTry(ConnectionOpenTry {
-            connection_id,
-            client_id,
-            counterparty_client_id,
-            counterparty_connection_id,
-        }) => IbcEvent::ConnectionOpenTry(ConnectionOpenTry {
-            connection_id,
-            client_id,
-            counterparty_client_id: counterparty_client_id.parse().unwrap(),
-            counterparty_connection_id,
-        }),
-        IbcEvent::ConnectionOpenAck(ConnectionOpenAck {
-            connection_id,
-            client_id,
-            counterparty_client_id,
-            counterparty_connection_id,
-        }) => IbcEvent::ConnectionOpenAck(ConnectionOpenAck {
-            connection_id,
-            client_id,
-            counterparty_client_id: counterparty_client_id.parse().unwrap(),
-            counterparty_connection_id,
-        }),
-        IbcEvent::ConnectionOpenConfirm(ConnectionOpenConfirm {
-            connection_id,
-            client_id,
-            counterparty_client_id,
-            counterparty_connection_id,
-        }) => IbcEvent::ConnectionOpenConfirm(ConnectionOpenConfirm {
-            connection_id,
-            client_id,
-            counterparty_client_id: counterparty_client_id.parse().unwrap(),
-            counterparty_connection_id,
-        }),
-        IbcEvent::ChannelOpenInit(ChannelOpenInit {
-            port_id,
-            channel_id,
-            counterparty_port_id,
-            connection_id,
-            version,
-        }) => IbcEvent::ChannelOpenInit(ChannelOpenInit {
-            port_id,
-            channel_id,
-            counterparty_port_id,
-            connection_id,
-            version,
-        }),
-        IbcEvent::ChannelOpenTry(ChannelOpenTry {
-            port_id,
-            channel_id,
-            counterparty_port_id,
-            counterparty_channel_id,
-            connection_id,
-            version,
-        }) => IbcEvent::ChannelOpenTry(ChannelOpenTry {
-            port_id,
-            channel_id,
-            counterparty_port_id,
-            counterparty_channel_id,
-            connection_id,
-            version,
-        }),
-        IbcEvent::ChannelOpenAck(ChannelOpenAck {
-            port_id,
-            channel_id,
-            counterparty_port_id,
-            counterparty_channel_id,
-            connection_id,
-        }) => IbcEvent::ChannelOpenAck(ChannelOpenAck {
-            port_id,
-            channel_id,
-            counterparty_port_id,
-            counterparty_channel_id,
-            connection_id,
-        }),
-        IbcEvent::ChannelOpenConfirm(ChannelOpenConfirm {
-            port_id,
-            channel_id,
-            counterparty_port_id,
-            counterparty_channel_id,
-            connection_id,
-        }) => IbcEvent::ChannelOpenConfirm(ChannelOpenConfirm {
-            port_id,
-            channel_id,
-            counterparty_port_id,
-            counterparty_channel_id,
-            connection_id,
-        }),
-        IbcEvent::WriteAcknowledgement(WriteAcknowledgement {
-            packet_data_hex,
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_ack_hex,
-            connection_id,
-        }) => IbcEvent::WriteAcknowledgement(WriteAcknowledgement {
-            packet_data_hex,
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_ack_hex,
-            connection_id,
-        }),
-        IbcEvent::RecvPacket(RecvPacket {
-            packet_data_hex,
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_channel_ordering,
-            connection_id,
-        }) => IbcEvent::RecvPacket(RecvPacket {
-            packet_data_hex,
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_channel_ordering,
-            connection_id,
-        }),
-        IbcEvent::SendPacket(SendPacket {
-            packet_data_hex,
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_channel_ordering,
-            connection_id,
-        }) => IbcEvent::SendPacket(SendPacket {
-            packet_data_hex,
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_channel_ordering,
-            connection_id,
-        }),
-        IbcEvent::AcknowledgePacket(AcknowledgePacket {
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_channel_ordering,
-            connection_id,
-        }) => IbcEvent::AcknowledgePacket(AcknowledgePacket {
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_channel_ordering,
-            connection_id,
-        }),
-        IbcEvent::TimeoutPacket(TimeoutPacket {
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_channel_ordering,
-            connection_id,
-        }) => IbcEvent::TimeoutPacket(TimeoutPacket {
-            packet_timeout_height,
-            packet_timeout_timestamp,
-            packet_sequence,
-            packet_src_port,
-            packet_src_channel,
-            packet_dst_port,
-            packet_dst_channel,
-            packet_channel_ordering,
-            connection_id,
-        }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::marker::PhantomData;
-
-    use block_message::BlockMessage;
-    use chain_utils::{
-        berachain::Berachain, cosmos::Cosmos, ethereum::Ethereum, scroll::Scroll, union::Union,
-        wasm::Wasm,
-    };
-    use hex_literal::hex;
-    use queue_msg::{
-        aggregate, defer_relative, effect, event, fetch, repeat, seq, Op, QueueMessage,
-    };
-    use relay_message::{
-        aggregate::AggregateMsgCreateClient,
-        chain::{
-            cosmos_sdk::{
-                fetch::{AbciQueryType, FetchAbciQuery},
-                wasm::WasmConfig,
-            },
-            ethereum::EthereumConfig,
-        },
-        effect::{MsgChannelOpenInitData, MsgConnectionOpenInitData},
-        event::IbcEvent,
-        fetch::{FetchSelfClientState, FetchSelfConsensusState},
-        RelayMessage,
-    };
-    use unionlabs::{
-        ethereum::config::Minimal,
-        events::ConnectionOpenTry,
-        hash::H256,
-        ibc::core::{
-            channel::{
-                self, channel::Channel, msg_channel_open_init::MsgChannelOpenInit, order::Order,
-            },
-            commitment::merkle_prefix::MerklePrefix,
-            connection::{self, msg_connection_open_init::MsgConnectionOpenInit, version::Version},
-        },
-        ics24,
-        uint::U256,
-        QueryHeight, DELAY_PERIOD,
-    };
-
-    use crate::{FromOp, VoyagerMessage};
-
-    macro_rules! parse {
-        ($expr:expr) => {
-            $expr.parse().unwrap()
-        };
-    }
-
-    #[test]
-    fn msg_serde() {
-        let union_chain_id: String = parse!("union-devnet-1");
-        let eth_chain_id: U256 = parse!("32382");
-        let simd_chain_id: String = parse!("simd-devnet-1");
-        let scroll_chain_id: U256 = parse!("534351");
-        let stargaze_chain_id: String = parse!("stargaze-devnet-1");
-        let osmosis_chain_id: String = parse!("osmosis-devnet-1");
-
-        println!("---------------------------------------");
-        println!("Union - Eth (Sending to Union) Connection Open: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(effect(
-            relay_message::id::<Wasm<Union>, Ethereum<Minimal>, _>(
-                union_chain_id.clone(),
-                MsgConnectionOpenInitData(MsgConnectionOpenInit {
-                    client_id: parse!("08-wasm-0"),
-                    counterparty: connection::counterparty::Counterparty {
-                        client_id: parse!("cometbls-0"),
-                        connection_id: parse!(""),
-                        prefix: MerklePrefix {
-                            key_prefix: b"ibc".to_vec(),
-                        },
-                    },
-                    version: Version {
-                        identifier: "1".into(),
-                        features: [Order::Ordered, Order::Unordered].into_iter().collect(),
-                    },
-                    delay_period: DELAY_PERIOD,
-                }),
-            ),
-        ));
-
-        println!("---------------------------------------");
-        println!("Fetch Client State: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(fetch(
-            relay_message::id::<Wasm<Union>, Ethereum<Minimal>, _>(
-                union_chain_id.clone(),
-                relay_message::fetch::Fetch::specific(FetchAbciQuery {
-                    path: ics24::Path::ClientState(ics24::ClientStatePath {
-                        client_id: parse!("client-id"),
-                    }),
-                    height: parse!("123-456"),
-                    ty: AbciQueryType::State,
-                }),
-            ),
-        ));
-
-        println!("---------------------------------------");
-        println!("Eth - Union (Sending to Union) Channel Open: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(effect(
-            relay_message::id::<Wasm<Union>, Ethereum<Minimal>, _>(
-                union_chain_id.clone(),
-                MsgChannelOpenInitData {
-                    msg: MsgChannelOpenInit {
-                        port_id: parse!("WASM_PORT_ID"),
-                        channel: Channel {
-                            state: channel::state::State::Init,
-                            ordering: channel::order::Order::Unordered,
-                            counterparty: channel::counterparty::Counterparty {
-                                port_id: parse!("ucs01-relay"),
-                                channel_id: parse!(""),
-                            },
-                            connection_hops: vec![parse!("connection-8")],
-                            version: "ucs01-0".to_string(),
-                        },
-                    },
-                    __marker: PhantomData,
-                },
-            ),
-        ));
-
-        println!("---------------------------------------");
-        println!("Eth - Union (Starting on Union) Channel Open: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(effect(
-            relay_message::id::<Ethereum<Minimal>, Wasm<Union>, _>(
-                eth_chain_id,
-                MsgChannelOpenInitData {
-                    msg: MsgChannelOpenInit {
-                        port_id: parse!("ucs01-relay"),
-                        channel: Channel {
-                            state: channel::state::State::Init,
-                            ordering: channel::order::Order::Ordered,
-                            counterparty: channel::counterparty::Counterparty {
-                                port_id: parse!("ucs01-relay"),
-                                channel_id: parse!(""),
-                            },
-                            connection_hops: vec![parse!("connection-8")],
-                            version: "ucs001-pingpong".to_string(),
-                        },
-                    },
-                    __marker: PhantomData,
-                },
-            ),
-        ));
-
-        println!("---------------------------------------");
-        println!("Eth - Union (Sending to Eth) Connection Open: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(effect(
-            relay_message::id::<Ethereum<Minimal>, Wasm<Union>, _>(
-                eth_chain_id,
-                MsgConnectionOpenInitData(MsgConnectionOpenInit {
-                    client_id: parse!("cometbls-0"),
-                    counterparty: connection::counterparty::Counterparty {
-                        client_id: parse!("08-wasm-0"),
-                        connection_id: parse!(""),
-                        prefix: MerklePrefix {
-                            key_prefix: b"ibc".to_vec(),
-                        },
-                    },
-                    version: Version {
-                        identifier: "1".into(),
-                        features: [Order::Ordered, Order::Unordered].into_iter().collect(),
-                    },
-                    delay_period: DELAY_PERIOD,
-                }),
-            ),
-        ));
-
-        println!("---------------------------------------");
-        println!("Eth - Union (Sending to Eth) Connection Try: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(event(
-            relay_message::id::<Ethereum<Minimal>, Wasm<Union>, _>(
-                eth_chain_id,
-                IbcEvent {
-                    tx_hash: H256([0; 32]),
-                    height: parse!("0-2941"),
-                    event: unionlabs::events::IbcEvent::ConnectionOpenTry(ConnectionOpenTry {
-                        connection_id: parse!("connection-0"),
-                        client_id: parse!("cometbls-0"),
-                        counterparty_client_id: parse!("08-wasm-1"),
-                        counterparty_connection_id: parse!("connection-14"),
-                    }),
-                },
-            ),
-        ));
-
-        println!("---------------------------------------");
-        println!("Eth - Union (Sending to Eth) Update Client: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(repeat(
-            None,
-            seq([
-                event(relay_message::id::<Ethereum<Minimal>, Wasm<Union>, _>(
-                    eth_chain_id,
-                    relay_message::event::Command::UpdateClient {
-                        client_id: parse!("cometbls-0"),
-                        __marker: PhantomData,
-                    },
-                )),
-                defer_relative(10),
-            ]),
-        ));
-
-        println!("---------------------------------------");
-        println!("Eth - Union (Sending to Union) Update Client: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(repeat(
-            None,
-            seq([
-                event(relay_message::id::<Wasm<Union>, Ethereum<Minimal>, _>(
-                    union_chain_id.clone(),
-                    relay_message::event::Command::UpdateClient {
-                        client_id: parse!("08-wasm-0"),
-                        __marker: PhantomData,
-                    },
-                )),
-                defer_relative(10),
-            ]),
-        ));
-
-        println!("---------------------------------------");
-        println!("Cosmos - Union (Sending to Cosmos) Update Client: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(repeat(
-            None,
-            seq([
-                event(relay_message::id::<Wasm<Cosmos>, Union, _>(
-                    simd_chain_id.clone(),
-                    relay_message::event::Command::UpdateClient {
-                        client_id: parse!("08-wasm-0"),
-                        __marker: PhantomData,
-                    },
-                )),
-                defer_relative(10),
-            ]),
-        ));
-
-        println!("---------------------------------------");
-        println!("Cosmos - Union (Sending to Union) Update Client: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(repeat(
-            None,
-            seq([
-                event(relay_message::id::<Union, Wasm<Cosmos>, _>(
-                    union_chain_id.clone(),
-                    relay_message::event::Command::UpdateClient {
-                        client_id: parse!("07-tendermint-0"),
-                        __marker: PhantomData,
-                    },
-                )),
-                defer_relative(10),
-            ]),
-        ));
-
-        println!("---------------------------------------");
-        println!("Scroll - Union (Sending to Union) Create Scroll lightclient on Union: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(aggregate(
-            [
-                fetch(relay_message::id::<Scroll, Wasm<Union>, _>(
-                    scroll_chain_id,
-                    FetchSelfClientState {
-                        at: QueryHeight::Latest,
-                        __marker: PhantomData,
-                    },
-                )),
-                fetch(relay_message::id::<Scroll, Wasm<Union>, _>(
-                    scroll_chain_id,
-                    FetchSelfConsensusState {
-                        at: QueryHeight::Latest,
-                        __marker: PhantomData,
-                    },
-                )),
-            ],
-            [],
-            relay_message::id::<Wasm<Union>, Scroll, _>(
-                union_chain_id.clone(),
-                AggregateMsgCreateClient {
-                    config: WasmConfig {
-                        checksum: H256(hex!(
-                            "c4c38c95b12a03dabe366dab1a19671193b5f8de7abf53eb3ecabbb946a4ac88"
-                        )),
-                    },
-                    __marker: PhantomData,
-                },
-            ),
-        ));
-
-        println!("---------------------------------------");
-        println!("Scroll - single update client");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(event(relay_message::id::<Scroll, Wasm<Union>, _>(
-            scroll_chain_id,
-            relay_message::event::Command::UpdateClient {
-                client_id: parse!("cometbls-0"),
-                __marker: PhantomData,
-            },
-        )));
-
-        println!("---------------------------------------");
-        println!("Union - Eth Create Both Clients: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(seq([
-            aggregate(
-                [
-                    fetch(relay_message::id::<Wasm<Union>, Ethereum<Minimal>, _>(
-                        union_chain_id.clone(),
-                        FetchSelfClientState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                    fetch(relay_message::id::<Wasm<Union>, Ethereum<Minimal>, _>(
-                        union_chain_id.clone(),
-                        FetchSelfConsensusState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                ],
-                [],
-                relay_message::id::<Ethereum<Minimal>, Wasm<Union>, _>(
-                    eth_chain_id,
-                    AggregateMsgCreateClient {
-                        config: EthereumConfig {
-                            client_type: "cometbls".to_string(),
-                        },
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-            aggregate(
-                [
-                    fetch(relay_message::id::<Ethereum<Minimal>, Wasm<Union>, _>(
-                        eth_chain_id,
-                        FetchSelfClientState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                    fetch(relay_message::id::<Ethereum<Minimal>, Wasm<Union>, _>(
-                        eth_chain_id,
-                        FetchSelfConsensusState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                ],
-                [],
-                relay_message::id::<Wasm<Union>, Ethereum<Minimal>, _>(
-                    union_chain_id.clone(),
-                    AggregateMsgCreateClient {
-                        config: WasmConfig {
-                            checksum: H256(hex!(
-                                "78266014ea77f3b785e45a33d1f8d3709444a076b3b38b2aeef265b39ad1e494"
-                            )),
-                        },
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-        ]));
-
-        println!("---------------------------------------");
-        println!("Union - Cosmos Create Both Client: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(seq([
-            aggregate(
-                [
-                    fetch(relay_message::id::<Wasm<Cosmos>, Union, _>(
-                        simd_chain_id.clone(),
-                        FetchSelfClientState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                    fetch(relay_message::id::<Wasm<Cosmos>, Union, _>(
-                        simd_chain_id.clone(),
-                        FetchSelfConsensusState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                ],
-                [],
-                relay_message::id::<Union, Wasm<Cosmos>, _>(
-                    union_chain_id.clone(),
-                    AggregateMsgCreateClient {
-                        config: (),
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-            aggregate(
-                [
-                    fetch(relay_message::id::<Union, Wasm<Cosmos>, _>(
-                        union_chain_id.clone(),
-                        FetchSelfClientState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                    fetch(relay_message::id::<Union, Wasm<Cosmos>, _>(
-                        union_chain_id.clone(),
-                        FetchSelfConsensusState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                ],
-                [],
-                relay_message::id::<Wasm<Cosmos>, Union, _>(
-                    simd_chain_id,
-                    AggregateMsgCreateClient {
-                        config: WasmConfig {
-                            checksum: H256(hex!(
-                                "78266014ea77f3b785e45a33d1f8d3709444a076b3b38b2aeef265b39ad1e494"
-                            )),
-                        },
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-        ]));
-
-        println!("---------------------------------------");
-        println!("Cosmos - Cosmos Create Both Client: ");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(seq([
-            aggregate(
-                [
-                    fetch(relay_message::id::<Cosmos, Cosmos, _>(
-                        stargaze_chain_id.clone(),
-                        FetchSelfClientState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                    fetch(relay_message::id::<Cosmos, Cosmos, _>(
-                        stargaze_chain_id.clone(),
-                        FetchSelfConsensusState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                ],
-                [],
-                relay_message::id::<Cosmos, Cosmos, _>(
-                    osmosis_chain_id.clone(),
-                    AggregateMsgCreateClient {
-                        config: (),
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-            aggregate(
-                [
-                    fetch(relay_message::id::<Cosmos, Cosmos, _>(
-                        osmosis_chain_id.clone(),
-                        FetchSelfClientState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                    fetch(relay_message::id::<Cosmos, Cosmos, _>(
-                        osmosis_chain_id.clone(),
-                        FetchSelfConsensusState {
-                            at: QueryHeight::Latest,
-                            __marker: PhantomData,
-                        },
-                    )),
-                ],
-                [],
-                relay_message::id::<Cosmos, Cosmos, _>(
-                    stargaze_chain_id.clone(),
-                    AggregateMsgCreateClient {
-                        config: (),
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-        ]));
-
-        println!("---------------------------------------");
-        println!("Scroll - single update client");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(event(relay_message::id::<Scroll, Wasm<Union>, _>(
-            scroll_chain_id,
-            relay_message::event::Command::UpdateClient {
-                client_id: parse!("cometbls-0"),
-                __marker: PhantomData,
-            },
-        )));
-
-        println!("---------------------------------------");
-        println!("Scroll - fetch update header");
-        println!("---------------------------------------");
-        print_json::<RelayMessage>(fetch(relay_message::id::<Scroll, Wasm<Union>, _>(
-            scroll_chain_id,
-            relay_message::fetch::Fetch::UpdateHeaders(relay_message::fetch::FetchUpdateHeaders {
-                counterparty_chain_id: union_chain_id.clone(),
-                counterparty_client_id: parse!("08-wasm-0"),
-                update_from: parse!("0-1"),
-                update_to: parse!("0-4846816"),
-            }),
-        )));
-
-        print_json::<BlockMessage>(fetch(block_message::id::<Cosmos, _>(
-            "simd-devnet-1".parse().unwrap(),
-            block_message::fetch::FetchBlock {
-                height: unionlabs::ibc::core::client::height::Height {
-                    revision_number: 1,
-                    revision_height: 1,
-                },
-            },
-        )));
-
-        print_json::<BlockMessage>(fetch(block_message::id::<Union, _>(
-            "union-devnet-1".parse().unwrap(),
-            block_message::fetch::FetchBlock {
-                height: unionlabs::ibc::core::client::height::Height {
-                    revision_number: 1,
-                    revision_height: 1,
-                },
-            },
-        )));
-
-        print_json::<RelayMessage>(fetch(relay_message::id::<Wasm<Union>, Berachain, _>(
-            parse!("union-testnet-8"),
-            relay_message::fetch::FetchUpdateHeaders {
-                counterparty_client_id: parse!("cometbls-4"),
-                counterparty_chain_id: parse!("80084"),
-                update_from: parse!("8-969001"),
-                update_to: parse!("8-969002"),
-            },
-        )));
-
-        print_json::<RelayMessage>(seq([
-            aggregate(
-                [
-                    fetch(relay_message::id::<Wasm<Union>, Berachain, _>(
-                        parse!("union-testnet-8"),
-                        FetchSelfClientState {
-                            at: parse!("8-968996"),
-                            __marker: PhantomData,
-                        },
-                    )),
-                    fetch(relay_message::id::<Wasm<Union>, Berachain, _>(
-                        parse!("union-testnet-8"),
-                        FetchSelfConsensusState {
-                            at: parse!("8-968996"),
-                            __marker: PhantomData,
-                        },
-                    )),
-                ],
-                [],
-                relay_message::id::<Berachain, Wasm<Union>, _>(
-                    parse!("80084"),
-                    AggregateMsgCreateClient {
-                        config: EthereumConfig {
-                            client_type: "cometbls".to_owned(),
-                        },
-                        __marker: PhantomData,
-                    },
-                ),
-            ),
-            fetch(relay_message::id::<Wasm<Union>, Berachain, _>(
-                parse!("union-testnet-8"),
-                relay_message::fetch::FetchUpdateHeaders {
-                    counterparty_client_id: parse!("cometbls-5"),
-                    counterparty_chain_id: parse!("80084"),
-                    update_from: parse!("8-968996"),
-                    update_to: parse!("8-969001"),
-                },
-            )),
-            fetch(relay_message::id::<Wasm<Union>, Berachain, _>(
-                parse!("union-testnet-8"),
-                relay_message::fetch::FetchUpdateHeaders {
-                    counterparty_client_id: parse!("cometbls-5"),
-                    counterparty_chain_id: parse!("80084"),
-                    update_from: parse!("8-969001"),
-                    update_to: parse!("8-969002"),
-                },
-            )),
-        ]));
-    }
-
-    fn print_json<T: QueueMessage>(msg: Op<T>)
-    where
-        VoyagerMessage: FromOp<T>,
+/// Convert a `jsonrpsee` [`ErrorObject`] to a `voyager-vm` [`QueueError`].
+///
+/// Certain error codes are treated as fatal (i.e. not retryable):
+///
+/// - [`FATAL_JSONRPC_ERROR_CODE`]: Custom error code that can be returned by
+///   plugin and modules to denote that a fatal error has occurred, and this
+///   message is not retryable.
+/// - [`METHOD_NOT_FOUND_CODE`]: The plugin or module does not expose the method
+///   that was attempted to be called. This indicates a bug in the plugin or
+///   module.
+/// - [`INVALID_PARAMS_CODE`]: The custom message sent to the plugin or module
+///   could not be deserialized. This could either be due a bug in the plugin or
+///   module (JSON serialization not roundtripping correctly) or a message that
+///   was manually inserted into the queue via `/enqueue`.
+pub fn error_object_to_queue_error(error: ErrorObject<'_>) -> QueueError {
+    if error.code() == FATAL_JSONRPC_ERROR_CODE
+        || error.code() == METHOD_NOT_FOUND_CODE
+        || error.code() == INVALID_PARAMS_CODE
     {
-        let msg = VoyagerMessage::from_op(msg);
+        QueueError::Fatal(Box::new(error.into_owned()))
+    } else {
+        QueueError::Retry(Box::new(error.into_owned()))
+    }
+}
 
-        let json = serde_json::to_string(&msg).unwrap();
+/// A message specific to a plugin.
+///
+/// This is used in [`Call`], [`Callback`], and [`Data`] to route messages to
+/// plugins.
+#[model]
+pub struct PluginMessage {
+    pub plugin: String,
+    pub message: Value,
+}
 
-        println!("{json}\n");
+impl PluginMessage {
+    pub fn new(plugin_name: impl Into<String>, message: impl Serialize) -> Self {
+        Self {
+            plugin: plugin_name.into(),
+            message: serde_json::to_value(message).expect(
+                "serialization must be infallible, this is a bug in the plugin implementation",
+            ),
+        }
+    }
 
-        let from_json = serde_json::from_str(&json).unwrap();
+    pub fn downcast<T: DeserializeOwned>(self, plugin_name: impl AsRef<str>) -> Result<T, Self> {
+        if self.plugin == plugin_name.as_ref() {
+            if let Ok(t) = serde_json::from_value(self.message.clone()) {
+                Ok(t)
+            } else {
+                Err(self)
+            }
+        } else {
+            Err(self)
+        }
+    }
+}
 
-        assert_eq!(&msg, &from_json, "json roundtrip failed");
+#[derive(clap::Subcommand)]
+pub enum DefaultCmd {}
+
+fn init_log() {
+    enum LogFormat {
+        Text,
+        Json,
+    }
+
+    let format = match std::env::var("RUST_LOG_FORMAT").as_deref() {
+        Err(VarError::NotPresent) | Ok("text") => LogFormat::Text,
+        Ok("json") => LogFormat::Json,
+        Err(VarError::NotUnicode(invalid)) => {
+            eprintln!("invalid non-utf8 log format {invalid:?}, defaulting to text");
+            LogFormat::Text
+        }
+        Ok(invalid) => {
+            eprintln!("invalid log format {invalid}, defaulting to text");
+            LogFormat::Text
+        }
+    };
+
+    match format {
+        LogFormat::Text => {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                // .with_span_events(FmtSpan::CLOSE)
+                .init();
+        }
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                // .with_span_events(FmtSpan::CLOSE)
+                .json()
+                .init();
+        }
+    }
+}
+
+#[allow(async_fn_in_trait)]
+pub trait Plugin: PluginServer<Self::Call, Self::Callback> + Sized {
+    type Call: Member;
+    type Callback: Member;
+
+    type Config: DeserializeOwned + Clone;
+    type Cmd: clap::Subcommand;
+
+    async fn new(config: Self::Config) -> Result<Self, BoxDynError>;
+
+    fn info(config: Self::Config) -> PluginInfo;
+
+    async fn cmd(config: Self::Config, cmd: Self::Cmd);
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ChainModule: ChainModuleServer + Sized {
+    type Config: DeserializeOwned + Clone;
+
+    async fn new(config: Self::Config, info: ChainModuleInfo) -> Result<Self, BoxDynError>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ConsensusModule: ConsensusModuleServer + Sized {
+    type Config: DeserializeOwned + Clone;
+
+    async fn new(config: Self::Config, info: ConsensusModuleInfo) -> Result<Self, BoxDynError>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ClientModule: ClientModuleServer + Sized {
+    type Config: DeserializeOwned + Clone;
+
+    async fn new(config: Self::Config, info: ClientModuleInfo) -> Result<Self, BoxDynError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct VoyagerClient(pub(crate) reconnecting_jsonrpc_ws_client::Client);
+
+impl VoyagerClient {
+    pub fn new(name: String, socket: String) -> Self {
+        let client = reconnecting_jsonrpc_ws_client::Client::new({
+            let voyager_socket: &'static str = socket.leak();
+            let name = name.clone();
+            move || {
+                async move {
+                    trace!("connecting to socket at {voyager_socket}");
+                    IpcClientBuilder::default().build(voyager_socket).await
+                }
+                .instrument(debug_span!("voyager_ipc_client", %name))
+            }
+        });
+        Self(client)
+    }
+}
+
+pub trait ExtensionsExt {
+    /// Retrieve a value from this [`Extensions`], returning an [`RpcResult`] for more
+    /// convenient handling in rpc server implementations.
+    fn try_get<T: Send + Sync + 'static>(&self) -> RpcResult<&T>;
+}
+
+impl ExtensionsExt for Extensions {
+    fn try_get<T: Send + Sync + 'static>(&self) -> RpcResult<&T> {
+        match self.get() {
+            Some(t) => Ok(t),
+            None => Err(ErrorObject::owned(
+                -1,
+                format!(
+                    "failed to retrieve value of type {} from extensions",
+                    std::any::type_name::<T>(),
+                ),
+                None::<()>,
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl jsonrpsee::core::client::ClientT for VoyagerClient {
+    async fn notification<Params>(
+        &self,
+        method: &str,
+        params: Params,
+    ) -> Result<(), jsonrpsee::core::client::Error>
+    where
+        Params: ToRpcParams + Send,
+    {
+        self.0.notification(method, params).await
+    }
+
+    async fn request<R, Params>(
+        &self,
+        method: &str,
+        params: Params,
+    ) -> Result<R, jsonrpsee::core::client::Error>
+    where
+        R: DeserializeOwned,
+        Params: ToRpcParams + Send,
+    {
+        self.0.request(method, params).await
+    }
+
+    async fn batch_request<'a, R>(
+        &self,
+        batch: BatchRequestBuilder<'a>,
+    ) -> Result<BatchResponse<'a, R>, jsonrpsee::core::client::Error>
+    where
+        R: DeserializeOwned + Debug + 'a,
+    {
+        self.0.batch_request(batch).await
+    }
+}
+
+#[derive(clap::Parser)]
+enum PluginApp<Cmd: clap::Subcommand> {
+    Run {
+        socket: String,
+        voyager_socket: String,
+        config: String,
+    },
+    Info {
+        config: String,
+    },
+    Cmd {
+        #[command(subcommand)]
+        cmd: Cmd,
+        #[arg(long)]
+        config: String,
+    },
+}
+
+#[derive(clap::Parser)]
+enum ModuleApp {
+    Run {
+        socket: String,
+        voyager_socket: String,
+        config: String,
+        info: String,
+    },
+}
+
+fn must_parse<T: DeserializeOwned>(config_str: &str) -> T {
+    match serde_json::from_str::<T>(config_str) {
+        Ok(ok) => ok,
+        Err(err) => {
+            error!("invalid config: {}", ErrorReporter(err));
+            std::process::exit(INVALID_CONFIG_EXIT_CODE as i32);
+        }
+    }
+}
+
+pub async fn run_plugin_server<T: Plugin>() {
+    init_log();
+
+    let app = <PluginApp<T::Cmd> as clap::Parser>::parse();
+
+    match app {
+        PluginApp::Run {
+            socket,
+            voyager_socket,
+            config,
+        } => {
+            let config = must_parse::<T::Config>(&config);
+
+            let info = T::info(config.clone());
+
+            let name = info.name;
+
+            run_server(
+                name.clone(),
+                voyager_socket,
+                config,
+                socket,
+                T::new,
+                T::into_rpc,
+            )
+            .instrument(debug_span!("run_plugin_server", %name))
+            .await
+        }
+        PluginApp::Info { config } => {
+            let info = T::info(must_parse(&config));
+
+            print!("{}", serde_json::to_string(&info).unwrap())
+        }
+        PluginApp::Cmd { cmd, config } => T::cmd(must_parse(&config), cmd).await,
+    }
+}
+
+pub async fn run_chain_module_server<T: ChainModule>() {
+    init_log();
+
+    match <ModuleApp as clap::Parser>::parse() {
+        ModuleApp::Run {
+            socket,
+            voyager_socket,
+            config,
+            info,
+        } => {
+            let config = must_parse::<T::Config>(&config);
+
+            let info = must_parse::<ChainModuleInfo>(&info);
+
+            let name = format!("chain/{}", info.chain_id);
+
+            run_server(
+                name.clone(),
+                voyager_socket,
+                (config, info),
+                socket,
+                |(config, info)| T::new(config, info),
+                T::into_rpc,
+            )
+            .instrument(debug_span!("run_chain_module_server", %name))
+            .await
+        }
+    }
+}
+
+pub async fn run_consensus_module_server<T: ConsensusModule>() {
+    init_log();
+
+    match <ModuleApp as clap::Parser>::parse() {
+        ModuleApp::Run {
+            socket,
+            voyager_socket,
+            config,
+            info,
+        } => {
+            let config = must_parse::<T::Config>(&config);
+
+            let info = must_parse::<ConsensusModuleInfo>(&info);
+
+            let name = format!("chain/{}", info.chain_id);
+
+            run_server(
+                name.clone(),
+                voyager_socket,
+                (config, info),
+                socket,
+                |(config, info)| T::new(config, info),
+                T::into_rpc,
+            )
+            .instrument(debug_span!("run_consensus_module_server", %name))
+            .await
+        }
+    }
+}
+
+pub async fn run_client_module_server<T: ClientModule>() {
+    init_log();
+
+    match <ModuleApp as clap::Parser>::parse() {
+        ModuleApp::Run {
+            socket,
+            voyager_socket,
+            config,
+            info,
+        } => {
+            let config = must_parse::<T::Config>(&config);
+
+            let info = must_parse::<ClientModuleInfo>(&info);
+
+            let id = info.id();
+
+            run_server(
+                id.clone(),
+                voyager_socket,
+                (config, info),
+                socket,
+                |(config, info)| T::new(config, info),
+                T::into_rpc,
+            )
+            .instrument(debug_span!("run_client_module_server", %id))
+            .await
+        }
+    }
+}
+
+async fn run_server<
+    T,
+    NewF: FnOnce(NewT) -> Fut,
+    NewT,
+    Fut: Future<Output = Result<T, BoxDynError>>,
+    IntoRpcF: FnOnce(T) -> RpcModule<T>,
+>(
+    id: String,
+    voyager_socket: String,
+    new_t: NewT,
+    socket: String,
+    new: NewF,
+    into_rpc: IntoRpcF,
+) {
+    let voyager_client = VoyagerClient::new(id.clone(), voyager_socket);
+    if let Err(err) = voyager_client
+        .0
+        .wait_until_connected(Duration::from_millis(500))
+        .await
+    {
+        error!("unable to connect to voyager socket: {err}");
+        std::process::exit(STARTUP_ERROR_EXIT_CODE as i32);
+    };
+
+    debug!("connected to voyager socket");
+
+    let module_server = match new(new_t).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            error!("startup error: {err:?}");
+            std::process::exit(STARTUP_ERROR_EXIT_CODE as i32);
+        }
+    };
+
+    let ipc_server = reth_ipc::server::Builder::default()
+        .set_rpc_middleware(
+            RpcServiceBuilder::new().layer_fn(move |service| InjectClient {
+                client: voyager_client.clone(),
+                service,
+            }),
+        )
+        .build(socket);
+
+    let rpcs = into_rpc(module_server);
+
+    trace!(methods = ?*rpcs, "registered methods");
+    let addr = ipc_server.endpoint();
+    let server_handle = ipc_server.start(rpcs).await.unwrap();
+    info!("listening on {addr}");
+
+    tokio::spawn(
+        server_handle
+            .stopped()
+            .instrument(debug_span!("module_server", %id)),
+    )
+    .await
+    .unwrap()
+}
+
+struct InjectClient<S> {
+    client: VoyagerClient,
+    service: S,
+}
+
+impl<'a, S: RpcServiceT<'a> + Send + Sync> RpcServiceT<'a> for InjectClient<S> {
+    type Future = S::Future;
+
+    fn call(&self, mut request: jsonrpsee::types::Request<'a>) -> Self::Future {
+        request.extensions.insert(self.client.clone());
+        self.service.call(request)
+    }
+}
+
+// TODO: Deduplicate this (it's also in the cosmos-sdk chain module), probably put it in voyager-message
+#[track_caller]
+pub fn into_value<T: Debug + Serialize>(t: T) -> Value {
+    match serde_json::to_value(t) {
+        Ok(ok) => ok,
+        Err(err) => {
+            error!(
+                error = %ErrorReporter(err),
+                "error serializing value of type {}",
+                std::any::type_name::<T>()
+            );
+
+            panic!(
+                "error serializing value of type {}",
+                std::any::type_name::<T>()
+            );
+        }
     }
 }

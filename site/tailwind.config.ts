@@ -3,7 +3,6 @@ import type { Config } from "tailwindcss"
 import tailwindAnimate from "tailwindcss-animate"
 import defaultTheme from "tailwindcss/defaultTheme"
 import typographyPlugin from "@tailwindcss/typography"
-import starlightPlugin from "@astrojs/starlight-tailwind"
 import aspectRatioPlugin from "@tailwindcss/aspect-ratio"
 import containerQueriesPlugin from "@tailwindcss/container-queries"
 
@@ -47,7 +46,7 @@ export default {
         bg2: "#030711"
       },
       fontFamily: {
-        sans: ["Inter var", ...defaultTheme.fontFamily.sans],
+        supermolot: ["Supermolot", ...defaultTheme.fontFamily.sans],
         display: [
           "Inter var",
           {
@@ -61,7 +60,6 @@ export default {
     }
   },
   plugins: [
-    starlightPlugin(),
     tailwindAnimate,
     typographyPlugin,
     aspectRatioPlugin,

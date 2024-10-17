@@ -1,14 +1,12 @@
 <script lang="ts">
+import { onMount } from "svelte"
 import { page } from "$app/stores"
 import { onNavigate } from "$app/navigation"
 import { cn } from "$lib/utilities/shadcn.ts"
 import type { LayoutData } from "./$types.ts"
 import Menu from "./(components)/menu.svelte"
-import { deviceWidth } from "$lib/utilities/device.ts"
 import StatsBar from "./(components)/stats-bar.svelte"
-import ArrowLeftIcon from "virtual:icons/lucide/arrow-left"
 import ExplorerBreadcrumbs from "$lib/components/explorer-breadcrumbs.svelte"
-import ExplorerPagination from "$lib/components/explorer-pagination.svelte"
 
 export let data: LayoutData
 
@@ -19,6 +17,16 @@ $: explorerPageDescription =
 onNavigate(navigation => {
   if (navigation.to?.route.id?.split("/").at(1) === "explorer") {
     explorerRoute = navigation.to?.route.id?.split("/").at(2) ?? null
+  }
+})
+
+onMount(() => {
+  const announcementElement = document.querySelector("div.betteruptime-announcement")
+  if (!announcementElement) return
+  const elementHeight = announcementElement.getBoundingClientRect().height
+  const explorerLayoutElement = document.querySelector("div[data-explorer-layout]")
+  if (explorerLayoutElement) {
+    explorerLayoutElement.style.paddingBottom = `${elementHeight + 10}px`
   }
 })
 </script>
@@ -56,7 +64,7 @@ onNavigate(navigation => {
     {/if}
 
     <div class="flex flex-col flex-1 size-full">
-      <div class="p-2 sm:p-4 md:p-6">
+      <div class="p-2 sm:p-4 md:p-6" data-explorer-layout>
         <div
           class={cn($page.route.id?.split("/").length === 3 ? "" : "hidden")}
         >

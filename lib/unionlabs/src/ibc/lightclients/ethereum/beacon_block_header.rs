@@ -41,18 +41,21 @@ impl From<BeaconBlockHeader> for protos::union::ibc::lightclients::ethereum::v1:
         Self {
             slot: value.slot,
             proposer_index: value.proposer_index,
-            parent_root: value.parent_root.0.into(),
-            state_root: value.state_root.0.into(),
-            body_root: value.body_root.0.into(),
+            parent_root: value.parent_root.get().into(),
+            state_root: value.state_root.get().into(),
+            body_root: value.body_root.get().into(),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, thiserror::Error)]
 pub enum TryFromBeaconBlockHeaderError {
-    ParentRoot(InvalidLength),
-    StateRoot(InvalidLength),
-    BodyRoot(InvalidLength),
+    #[error("invalid `parent_root`")]
+    ParentRoot(#[source] InvalidLength),
+    #[error("invalid `state_root`")]
+    StateRoot(#[source] InvalidLength),
+    #[error("invalid `body_root`")]
+    BodyRoot(#[source] InvalidLength),
 }
 
 impl TryFrom<protos::union::ibc::lightclients::ethereum::v1::BeaconBlockHeader>

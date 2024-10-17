@@ -1,9 +1,9 @@
 import Icons from "unplugin-icons/vite"
 import Inspect from "vite-plugin-inspect"
 import { sveltekit } from "@sveltejs/kit/vite"
-import { sentrySvelteKit } from "@sentry/sveltekit"
 import { visualizer } from "rollup-plugin-visualizer"
 import { purgeCss } from "vite-plugin-tailwind-purgecss"
+import { nodePolyfills } from "vite-plugin-node-polyfills"
 import { partytownVite } from "@builder.io/partytown/utils"
 import { defineConfig, loadEnv, type PluginOption } from "vite"
 
@@ -12,17 +12,15 @@ export default defineConfig(config => {
     INSPECT,
     NODE_ENV,
     VISUALIZE,
+    ENVIRONMENT,
     PORT = process.env.PORT || 5173
   } = loadEnv(config.mode, process.cwd(), "") as unknown as EnvironmentVariables
 
   const plugins = [
     purgeCss(),
-    sentrySvelteKit({
-      sourceMapsUploadOptions: {
-        project: "app",
-        telemetry: true,
-        org: "unionlabs"
-      }
+    nodePolyfills({
+      include: ["stream"],
+      globals: { process: true, Buffer: true, global: true }
     }),
     sveltekit(),
     partytownVite({
@@ -35,29 +33,19 @@ export default defineConfig(config => {
   if (INSPECT === "true") plugins.push(Inspect())
   if (VISUALIZE === "true") plugins.push(visualizer({ filename: `stats/${Date.now()}_stats.html` }))
 
+  // we want logs to show up in preview deployments for debugging
+  const dropLogStatements = config.mode === "build" && ENVIRONMENT === "production"
   return {
     plugins,
+    build: { target: "es2020" },
     esbuild: {
-      drop: ["console", "debugger"]
+      drop: dropLogStatements ? ["console", "debugger"] : []
     },
     optimizeDeps: {
       exclude: ["@tanstack/svelte-query-devtools"]
     },
     server: {
       port: Number(PORT)
-    },
-    define: {
-      // Node polyfills
-      "process.env": {}
-    },
-    // Node polyfills
-    resolve: {
-      alias: {
-        "node:buffer": "buffer",
-        "node:events": "events",
-        "node:process": "process",
-        stream: "rollup-plugin-node-polyfills/polyfills/stream"
-      }
     },
     test: { include: ["src/**/*.{test,spec}.{js,ts}"] }
   }

@@ -1,5 +1,12 @@
-{ self, ... }: {
-  perSystem = { self', pkgs, crane, ... }:
+{ self, ... }:
+{
+  perSystem =
+    {
+      self',
+      pkgs,
+      crane,
+      ...
+    }:
     let
       hubble = crane.buildWorkspaceMember {
         crateDirFromRoot = "hubble";
@@ -15,11 +22,15 @@
     {
       inherit (hubble) checks;
       packages = {
-        hubble = hubble.packages.hubble;
+        inherit (hubble.packages) hubble;
 
         hubble-image = pkgs.dockerTools.buildLayeredImage {
           name = "hubble";
-          contents = [ pkgs.coreutils-full pkgs.cacert self'.packages.hubble ];
+          contents = [
+            pkgs.coreutils-full
+            pkgs.cacert
+            self'.packages.hubble
+          ];
           config = {
             Entrypoint = [ (pkgs.lib.getExe self'.packages.hubble) ];
             Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
@@ -28,7 +39,13 @@
       };
     };
 
-  flake.nixosModules.hubble = { lib, pkgs, config, ... }:
+  flake.nixosModules.hubble =
+    {
+      lib,
+      pkgs,
+      config,
+      ...
+    }:
     with lib;
     let
       cfg = config.services.hubble;
@@ -55,7 +72,28 @@
         indexers = mkOption {
           type = types.listOf (
             types.submodule {
-              options.label = mkOption { type = types.str; example = "something-custom"; };
+              options.indexer_id = mkOption {
+                type = types.nullOr types.str;
+                description = "Id of the indexer which is used by the internal administration of Hubble. Should never change.";
+                example = "amazing-testnet";
+                default = null;
+              };
+              options.internal_chain_id = mkOption {
+                type = types.nullOr types.number;
+                description = "Hubble internal chain id, used to fetch the current height when migrating to fetchers.";
+                example = "4";
+                default = null;
+              };
+              options.new_chain_override = mkOption {
+                type = types.nullOr types.bool;
+                description = "Indicator that this is a new chain, so the current height must not be used when migrating to fetchers.";
+                example = "false";
+                default = null;
+              };
+              options.label = mkOption {
+                type = types.str;
+                example = "something-custom";
+              };
               options.filter = mkOption {
                 type = types.nullOr types.str;
                 description = "A regex which if matches, removes the event from the insertion";
@@ -67,7 +105,18 @@
                 example = [ "https://rpc.example.com" ];
                 default = null;
               };
-
+              options.rpc_urls = mkOption {
+                type = types.nullOr (types.listOf types.str);
+                description = "List of rpc urls";
+                example = [ "https://rpc.example.com" ];
+                default = null;
+              };
+              options.grpc_urls = mkOption {
+                type = types.nullOr (types.listOf types.str);
+                description = "List of grpc urls";
+                example = [ "https://grpc.example.com" ];
+                default = null;
+              };
               # arb consensus height indexer
               options.l1_url = mkOption {
                 type = types.nullOr types.str;
@@ -95,16 +144,61 @@
                 default = null;
               };
 
-              options.chain_id = mkOption { type = types.nullOr types.str; example = "union-testnet-8"; default = null; };
-              options.grpc_url = mkOption { type = types.nullOr types.str; example = "https://grpc.example.com"; default = null; };
-              options.type = mkOption { type = types.enum [ "tendermint" "ethereum" "beacon" "bera" "ethereum-fork" "arb" "scroll" ]; };
-              options.start_height = mkOption { type = types.int; example = 1; default = 0; };
-              options.chunk_size = mkOption { type = types.int; example = 1; default = 200; };
-              options.until = mkOption { type = types.int; example = 1; default = 1000000000000; };
-              options.harden = mkOption { type = types.bool; example = true; default = true; };
+              options.chain_id = mkOption {
+                type = types.nullOr types.str;
+                example = "union-testnet-8";
+                default = null;
+              };
+              options.grpc_url = mkOption {
+                type = types.nullOr types.str;
+                example = "https://grpc.example.com";
+                default = null;
+              };
+              options.type = mkOption {
+                type = types.enum [
+                  "beacon"
+                  "bera"
+                  "arb"
+                  "scroll"
+                  "eth-fetcher"
+                  "tm-fetcher"
+                  "aptos-fetcher"
+                ];
+              };
+              options.start_height = mkOption {
+                type = types.int;
+                example = 1;
+                default = 0;
+              };
+              options.chunk_size = mkOption {
+                type = types.int;
+                example = 1;
+                default = 200;
+              };
+              options.tx_search_max_page_size = mkOption {
+                type = types.int;
+                description = "Maximum number of transactions to fetch in one page";
+                example = 1;
+                default = 100;
+              };
+              options.until = mkOption {
+                type = types.int;
+                example = 1;
+                default = 1000000000000;
+              };
+              options.harden = mkOption {
+                type = types.bool;
+                example = true;
+                default = true;
+              };
               options.interval = mkOption {
-                example = { secs = 1; };
-                default = { secs = 12; nanos = 0; };
+                example = {
+                  secs = 1;
+                };
+                default = {
+                  secs = 12;
+                  nanos = 0;
+                };
                 type = types.submodule {
                   options = {
                     secs = mkOption {
@@ -126,10 +220,29 @@
           description = "RUST_LOG passed to hubble";
           example = "hubble=debug";
         };
+        backtrace = mkOption {
+          type = types.enum [
+            "0"
+            "1"
+            "full"
+          ];
+          default = "1";
+          description = "RUST_BACKTRACE passed to hubble";
+          example = "full";
+        };
         log-format = mkOption {
-          type = types.enum [ "json" "plain" ];
+          type = types.enum [
+            "json"
+            "plain"
+          ];
           default = "json";
           example = "plain";
+        };
+        tokens_urls = mkOption {
+          type = types.nullOr (types.listOf types.str);
+          description = "List of tokenlist urls";
+          example = [ "https://static.optimism.io/optimism.tokenlist.json" ];
+          default = null;
         };
       };
 
@@ -138,17 +251,22 @@
           let
             hubble-systemd-script = pkgs.writeShellApplication {
               name = "hubble-systemd";
-              runtimeInputs = [ pkgs.coreutils cfg.package ];
+              runtimeInputs = [
+                pkgs.coreutils
+                cfg.package
+              ];
               text =
                 let
                   indexersJson = builtins.toJSON cfg.indexers;
+                  tokensUrlsJson = builtins.toJSON cfg.tokens_urls;
                 in
                 ''
                   ${pkgs.lib.getExe cfg.package}  \
                     --database-url "$(head -n 1 ${cfg.api-key-file})" \
                     --log-format ${cfg.log-format} \
                     --metrics-addr ${cfg.metrics-addr} \
-                    --indexers '${indexersJson}' 
+                    --indexers '${indexersJson}' \
+                    --tokens-urls '${tokensUrlsJson}'
                 '';
             };
           in
@@ -166,6 +284,7 @@
             };
             environment = {
               RUST_LOG = "${cfg.log-level}";
+              RUST_BACKTRACE = "${cfg.backtrace}";
             };
           };
       };
