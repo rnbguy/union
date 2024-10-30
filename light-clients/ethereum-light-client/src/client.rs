@@ -486,17 +486,12 @@ pub fn do_verify_membership(
 ) -> Result<(), Error> {
     check_commitment_key(path, ibc_commitment_slot, storage_proof.key)?;
 
-    // we store the hash of the data, not the data itself to the commitments map
-    let mut hasher = Sha256::new();
-    hasher.update(raw_value);
-    let expected_value_hash = H256::from(hasher.finalize());
+    let proof_value = storage_proof.value.to_be_bytes();
 
-    let proof_value = H256::from(storage_proof.value.to_be_bytes());
-
-    if expected_value_hash != proof_value {
+    if raw_value != proof_value {
         return Err(StoredValueMismatch {
-            expected: expected_value_hash,
-            stored: proof_value,
+            expected: serde_utils::to_hex(raw_value),
+            stored: serde_utils::to_hex(proof_value),
         }
         .into());
     }
