@@ -138,8 +138,8 @@ pub struct InvalidCommitmentKey {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("expected value ({expected}) and stored value ({stored}) don't match")]
 pub struct StoredValueMismatch {
-    pub expected: H256,
-    pub stored: H256,
+    pub expected: String,
+    pub stored: String,
 }
 
 impl From<Error> for IbcClientError<EthereumLightClient> {

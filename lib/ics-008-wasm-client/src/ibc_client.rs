@@ -106,7 +106,7 @@ pub trait IbcClient: Sized {
                 delay_time_period,
                 delay_block_period,
                 proof,
-                path,
+                merkle_path,
                 value,
             } => to_json_binary(&Self::verify_membership(
                 deps.as_ref(),
@@ -114,7 +114,11 @@ pub trait IbcClient: Sized {
                 delay_time_period,
                 delay_block_period,
                 proof.into(),
-                path.into_iter().map(|binary| binary.into()).collect(),
+                merkle_path
+                    .key_path
+                    .into_iter()
+                    .map(|binary| binary.into())
+                    .collect(),
                 StorageState::Occupied(value.into()),
             )?),
             SudoMsg::VerifyNonMembership {
@@ -122,14 +126,18 @@ pub trait IbcClient: Sized {
                 delay_time_period,
                 delay_block_period,
                 proof,
-                path,
+                merkle_path,
             } => to_json_binary(&Self::verify_membership(
                 deps.as_ref(),
                 height,
                 delay_time_period,
                 delay_block_period,
                 proof.into(),
-                path.into_iter().map(|binary| binary.into()).collect(),
+                merkle_path
+                    .key_path
+                    .into_iter()
+                    .map(|binary| binary.into())
+                    .collect(),
                 StorageState::Empty,
             )?),
             SudoMsg::UpdateState { client_message } => {

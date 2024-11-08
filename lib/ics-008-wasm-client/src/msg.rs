@@ -45,6 +45,11 @@ pub struct ExportMetadataResult {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct MerklePath {
+    pub key_path: Vec<Binary>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum SudoMsg {
     VerifyMembership {
@@ -52,7 +57,7 @@ pub enum SudoMsg {
         delay_time_period: u64,
         delay_block_period: u64,
         proof: Binary,
-        path: Vec<Binary>,
+        merkle_path: MerklePath,
         value: Binary,
     },
 
@@ -61,7 +66,7 @@ pub enum SudoMsg {
         delay_time_period: u64,
         delay_block_period: u64,
         proof: Binary,
-        path: Vec<Binary>,
+        merkle_path: MerklePath,
     },
     UpdateState {
         client_message: Binary,
