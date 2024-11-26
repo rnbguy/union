@@ -22,23 +22,19 @@ use serde_utils::to_hex;
 use sha2::{Digest, Sha256};
 use unionlabs::{
     cosmwasm::wasm::union::custom_query::UnionCustomQuery,
-    encoding::{DecodeAs, EncodeAs, EthAbi, Proto},
+    encoding::{DecodeAs, Proto},
     ensure,
     ethereum::{ibc_commitment_key_v2, keccak256},
-    google::protobuf::any::Any,
     hash::H256,
     ibc::{
-        core::client::{genesis_metadata::GenesisMetadata, height::Height},
-        lightclients::{
-            cometbls,
-            ethereum::{
-                client_state::ClientState, consensus_state::ConsensusState, header::Header,
-                misbehaviour::Misbehaviour, storage_proof::StorageProof,
-            },
-            wasm,
+        core::{
+            client::{genesis_metadata::GenesisMetadata, height::Height},
+        },
+        lightclients::ethereum::{
+            client_state::ClientState, consensus_state::ConsensusState, header::Header,
+            misbehaviour::Misbehaviour, storage_proof::StorageProof,
         },
     },
-    ics24::Path,
     uint::U256,
 };
 
@@ -509,33 +505,33 @@ pub fn do_verify_membership(
 // the counterparty (ethereum in this case) stores it as raw bytes. this will no longer be
 // required with ibc-go v9.
 pub fn canonicalize_stored_value(
-    path: String,
+    _path: String,
     raw_value: Vec<u8>,
 ) -> Result<Vec<u8>, CanonicalizeStoredValueError> {
-    let path = path
-        .parse::<Path>()
-        .map_err(|_| CanonicalizeStoredValueError::UnknownIbcPath(path))?;
+    // let path = path
+    //     .parse::<Path>()
+    //     .map_err(|_| CanonicalizeStoredValueError::UnknownIbcPath(path))?;
 
-    let canonical_value = match path {
-        // proto(any<cometbls>) -> ethabi(cometbls)
-        Path::ClientState(_) => {
-            Any::<cometbls::client_state::ClientState>::decode_as::<Proto>(raw_value.as_ref())
-                .map_err(CanonicalizeStoredValueError::CometblsClientStateDecode)?
-                .0
-                .encode_as::<EthAbi>()
-        }
-        // proto(any<wasm<cometbls>>) -> ethabi(cometbls)
-        Path::ClientConsensusState(_) => Any::<
-            wasm::consensus_state::ConsensusState<cometbls::consensus_state::ConsensusState>,
-        >::decode_as::<Proto>(raw_value.as_ref())
-        .map_err(CanonicalizeStoredValueError::CometblsConsensusStateDecode)?
-        .0
-        .data
-        .encode_as::<EthAbi>(),
-        _ => raw_value,
-    };
+    // let canonical_value = match path {
+    //     // proto(any<cometbls>) -> ethabi(cometbls)
+    //     Path::ClientState(_) => {
+    //         Any::<cometbls::client_state::ClientState>::decode_as::<Proto>(raw_value.as_ref())
+    //             .map_err(CanonicalizeStoredValueError::CometblsClientStateDecode)?
+    //             .0
+    //             .encode_as::<EthAbi>()
+    //     }
+    //     // proto(any<wasm<cometbls>>) -> ethabi(cometbls)
+    //     Path::ClientConsensusState(_) => Any::<
+    //         wasm::consensus_state::ConsensusState<cometbls::consensus_state::ConsensusState>,
+    //     >::decode_as::<Proto>(raw_value.as_ref())
+    //     .map_err(CanonicalizeStoredValueError::CometblsConsensusStateDecode)?
+    //     .0
+    //     .data
+    //     .encode_as::<EthAbi>(),
+    //     _ => raw_value,
+    // };
 
-    Ok(canonical_value)
+    Ok(raw_value)
 }
 
 /// Verifies that no value is committed at `path` in the counterparty light client's storage.
@@ -589,8 +585,9 @@ mod test {
     };
     use serde::Deserialize;
     use unionlabs::{
-        encoding::{Encode, Proto},
+        encoding::{Encode, Proto, EncodeAs},
         ethereum::config::{Mainnet, Minimal},
+        google::protobuf::any::Any,
         ibc::{core::connection::connection_end::ConnectionEnd, lightclients::ethereum},
     };
 

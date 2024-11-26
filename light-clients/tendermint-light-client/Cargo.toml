@@ -29,10 +29,12 @@ sha2            = { workspace = true }
 sha3            = { workspace = true }
 thiserror       = { workspace = true }
 
-ics008-wasm-client  = { workspace = true }
-ics23               = { workspace = true }
-tendermint-verifier = { workspace = true }
-unionlabs           = { workspace = true, features = ["cosmwasm"] }
+cometbft-types                = { workspace = true, features = ["proto", "hash"] }
+ics008-wasm-client            = { workspace = true }
+ics23                         = { workspace = true }
+tendermint-light-client-types = { workspace = true, features = ["proto"] }
+tendermint-verifier           = { workspace = true }
+unionlabs                     = { workspace = true, features = ["cosmwasm"] }
 
 [dev-dependencies]
 base64      = { workspace = true }

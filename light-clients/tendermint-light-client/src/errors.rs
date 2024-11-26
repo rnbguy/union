@@ -1,11 +1,9 @@
 use ics008_wasm_client::{IbcClient, IbcClientError};
+use tendermint_light_client_types::{ClientState, Header};
 use unionlabs::{
     encoding::{DecodeErrorOf, Proto},
     hash::H256,
-    ibc::{
-        core::commitment::merkle_proof::MerkleProof,
-        lightclients::{cometbls::header::Header, tendermint},
-    },
+    ibc::core::commitment::merkle_proof::MerkleProof,
 };
 
 use crate::client::TendermintLightClient;
@@ -30,7 +28,7 @@ pub enum Error {
     MerkleProofDecode(#[from] MerkleProofDecode),
 
     #[error("unable to decode client state")]
-    ClientStateDecode(#[source] DecodeErrorOf<Proto, tendermint::client_state::ClientState>),
+    ClientStateDecode(#[source] DecodeErrorOf<Proto, ClientState>),
 
     #[error(transparent)]
     IbcHeightTooLargeForTendermintHeight(#[from] IbcHeightTooLargeForTendermintHeight),

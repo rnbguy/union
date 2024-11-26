@@ -35,7 +35,7 @@ pub fn schedule_create_client_checker(
                 let tm_clients = match unmapped_client_ids(&pg_pool, internal_chain_id).await {
                     Ok(tm_clients) => tm_clients,
                     Err(err) => {
-                        error!("error fetching unmapped clients: {} => retry later", err);
+                        error!("error fetching unmapped clients: {:?} => retry later", err);
                         continue;
                     },
                 };
@@ -89,7 +89,7 @@ pub fn schedule_create_client_checker(
                                     cs.chain_id.to_string()
                                 }
                                 WasmClientType::Cometbls => {
-                                    let cs = match unionlabs::ibc::lightclients::cometbls::client_state::ClientState::decode_as::<Proto>(&cs.data) {
+                                    let cs = match cometbls_light_client_types::ClientState::decode_as::<Proto>(&cs.data) {
                                         Ok(cs) => cs,
                                         Err(err) => {
                                             warn!("error while decoding client {client_id}: {:?}. Most likely due to a client state upgrade. This can then be safely ignored", err);
@@ -97,10 +97,10 @@ pub fn schedule_create_client_checker(
                                         }
                                     };
 
-                                    cs.chain_id
+                                    cs.chain_id.as_str().to_owned()
                                 }
                                 WasmClientType::Tendermint => {
-                                    let cs = match unionlabs::ibc::lightclients::tendermint::client_state::ClientState::decode_as::<Proto>(&cs.data) {
+                                    let cs = match tendermint_light_client_types::ClientState::decode_as::<Proto>(&cs.data) {
                                         Ok(cs) => cs,
                                         Err(err) => {
                                             warn!("error while decoding client {client_id}: {:?}. Most likely due to a client state upgrade. This can then be safely ignored", err);
@@ -111,7 +111,7 @@ pub fn schedule_create_client_checker(
                                     cs.chain_id
                                 }
                                 WasmClientType::Scroll => {
-                                    let cs = match unionlabs::ibc::lightclients::scroll::client_state::ClientState::decode_as::<Proto>(&cs.data) {
+                                    let cs = match scroll_light_client_types::ClientState::decode_as::<Proto>(&cs.data) {
                                         Ok(cs) => cs,
                                         Err(err) => {
                                             warn!("error while decoding client {client_id}: {:?}. Most likely due to a client state upgrade. This can then be safely ignored", err);
@@ -122,7 +122,7 @@ pub fn schedule_create_client_checker(
                                     cs.chain_id.to_string()
                                 }
                                 WasmClientType::Arbitrum => {
-                                    let cs = match unionlabs::ibc::lightclients::arbitrum::client_state::ClientState::decode_as::<Proto>(&cs.data) {
+                                    let cs = match arbitrum_light_client_types::ClientState::decode_as::<Proto>(&cs.data) {
                                         Ok(cs) => cs,
                                         Err(err) => {
                                             warn!("error while decoding client {client_id}: {:?}. Most likely due to a client state upgrade. This can then be safely ignored", err);
@@ -134,7 +134,7 @@ pub fn schedule_create_client_checker(
                                 }
                                 WasmClientType::Linea => todo!("We still need to add linea"),
                                 WasmClientType::Berachain => {
-                                    let cs = match unionlabs::ibc::lightclients::berachain::client_state::ClientState::decode_as::<Proto>(&cs.data) {
+                                    let cs = match berachain_light_client_types::ClientState::decode_as::<Proto>(&cs.data) {
                                         Ok(cs) => cs,
                                         // We changed the format of berachain client states, but union-testnet-8 still contains an old configuration which we need to ignore.
                                         Err(err) => {
@@ -149,7 +149,7 @@ pub fn schedule_create_client_checker(
                                     todo!("We still need to add evm-in-cosmos")
                                 }
                                 WasmClientType::Movement => {
-                                    let cs = match unionlabs::ibc::lightclients::movement::client_state::ClientState::decode_as::<Proto>(&cs.data) {
+                                    let cs = match movement_light_client_types::ClientState::decode_as::<Proto>(&cs.data) {
                                         Ok(cs) => cs,
                                         Err(err) => {
                                             warn!("error while decoding client {client_id}: {:?}. Most likely due to a client state upgrade. This can then be safely ignored", err);

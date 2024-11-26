@@ -10,8 +10,9 @@ import "@openzeppelin/utils/math/Math.sol";
 
 contract IBCPacketTests is Test {
     string public constant CLIENT_TYPE = "zkgm";
-    bytes32 public constant VERSION = keccak256("protocol-1");
+    string public constant VERSION = "zkgm-1";
     uint32 public constant COUNTERPARTY_CHANNEL_ID = 0xDEADC0DE;
+    string public constant COUNTERPARTY_PORT_ID = "wasm.abcdef";
 
     TestIBCHandler handler;
     TestLightClient lightClient;
@@ -41,9 +42,7 @@ contract IBCPacketTests is Test {
         IBCMsgs.MsgConnectionOpenTry memory msgTry_ = IBCMsgs
             .MsgConnectionOpenTry({
             counterpartyConnectionId: 0xCAFE,
-            counterpartyClientType: "zkgm",
             counterpartyClientId: 0xDEADC0DE,
-            clientType: CLIENT_TYPE,
             clientId: clientId,
             proofInit: hex"",
             proofHeight: 0,
@@ -64,6 +63,7 @@ contract IBCPacketTests is Test {
         // Create channel
         IBCMsgs.MsgChannelOpenInit memory msgInit_ = IBCMsgs.MsgChannelOpenInit({
             portId: address(module),
+            counterpartyPortId: COUNTERPARTY_PORT_ID,
             connectionId: connectionId,
             ordering: IBCChannelOrder.Unordered,
             version: VERSION,
@@ -71,7 +71,6 @@ contract IBCPacketTests is Test {
         });
         channelId = handler.channelOpenInit(msgInit_);
         IBCMsgs.MsgChannelOpenAck memory msgAck_ = IBCMsgs.MsgChannelOpenAck({
-            portId: address(module),
             channelId: channelId,
             counterpartyVersion: VERSION,
             counterpartyChannelId: COUNTERPARTY_CHANNEL_ID,
@@ -209,6 +208,54 @@ contract IBCPacketTests is Test {
     ) public {
         vm.pauseGasMetering();
         test_recvPacket_ok(sourceChannel, message, 1);
+    }
+
+    function test_recvPacket_ok_5(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvPacket_ok(sourceChannel, message, 5);
+    }
+
+    function test_recvPacket_ok_10(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvPacket_ok(sourceChannel, message, 10);
+    }
+
+    function test_recvPacket_ok_15(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvPacket_ok(sourceChannel, message, 15);
+    }
+
+    function test_recvPacket_ok_20(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvPacket_ok(sourceChannel, message, 20);
+    }
+
+    function test_recvPacket_ok_25(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvPacket_ok(sourceChannel, message, 25);
+    }
+
+    function test_recvPacket_ok_30(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvPacket_ok(sourceChannel, message, 30);
     }
 
     function test_recvPacket_ok(
@@ -382,6 +429,54 @@ contract IBCPacketTests is Test {
         test_recvIntentPacket_ok(sourceChannel, message, 1);
     }
 
+    function test_recvIntentPacket_ok_5(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvIntentPacket_ok(sourceChannel, message, 5);
+    }
+
+    function test_recvIntentPacket_ok_10(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvIntentPacket_ok(sourceChannel, message, 10);
+    }
+
+    function test_recvIntentPacket_ok_15(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvIntentPacket_ok(sourceChannel, message, 15);
+    }
+
+    function test_recvIntentPacket_ok_20(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvIntentPacket_ok(sourceChannel, message, 20);
+    }
+
+    function test_recvIntentPacket_ok_25(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvIntentPacket_ok(sourceChannel, message, 25);
+    }
+
+    function test_recvIntentPacket_ok_30(
+        uint32 sourceChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_recvIntentPacket_ok(sourceChannel, message, 30);
+    }
+
     function test_recvIntentPacket_ok(
         uint32 sourceChannel,
         bytes calldata message,
@@ -402,6 +497,7 @@ contract IBCPacketTests is Test {
         }
         vm.resumeGasMetering();
         handler.recvIntentPacket(msg_);
+        vm.pauseGasMetering();
     }
 
     function test_recvIntentPacket_commitmentSaved(
@@ -518,6 +614,54 @@ contract IBCPacketTests is Test {
     ) public {
         vm.pauseGasMetering();
         test_acknowledgePacket_ok(destinationChannel, message, 1);
+    }
+
+    function test_acknowledgePacket_ok_5(
+        uint32 destinationChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_acknowledgePacket_ok(destinationChannel, message, 5);
+    }
+
+    function test_acknowledgePacket_ok_10(
+        uint32 destinationChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_acknowledgePacket_ok(destinationChannel, message, 10);
+    }
+
+    function test_acknowledgePacket_ok_15(
+        uint32 destinationChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_acknowledgePacket_ok(destinationChannel, message, 15);
+    }
+
+    function test_acknowledgePacket_ok_20(
+        uint32 destinationChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_acknowledgePacket_ok(destinationChannel, message, 20);
+    }
+
+    function test_acknowledgePacket_ok_25(
+        uint32 destinationChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_acknowledgePacket_ok(destinationChannel, message, 25);
+    }
+
+    function test_acknowledgePacket_ok_30(
+        uint32 destinationChannel,
+        bytes calldata message
+    ) public {
+        vm.pauseGasMetering();
+        test_acknowledgePacket_ok(destinationChannel, message, 30);
     }
 
     function test_acknowledgePacket_tampered(
@@ -929,12 +1073,60 @@ contract IBCPacketTests is Test {
         return packets;
     }
 
+    function test_batchSend_ok_2(
+        uint64 timeoutTimestamp,
+        uint64 timeoutHeight
+    ) public {
+        vm.pauseGasMetering();
+        test_batchSend_ok(timeoutTimestamp, timeoutHeight, 2);
+    }
+
+    function test_batchSend_ok_5(
+        uint64 timeoutTimestamp,
+        uint64 timeoutHeight
+    ) public {
+        vm.pauseGasMetering();
+        test_batchSend_ok(timeoutTimestamp, timeoutHeight, 5);
+    }
+
     function test_batchSend_ok_10(
         uint64 timeoutTimestamp,
         uint64 timeoutHeight
     ) public {
         vm.pauseGasMetering();
         test_batchSend_ok(timeoutTimestamp, timeoutHeight, 10);
+    }
+
+    function test_batchSend_ok_15(
+        uint64 timeoutTimestamp,
+        uint64 timeoutHeight
+    ) public {
+        vm.pauseGasMetering();
+        test_batchSend_ok(timeoutTimestamp, timeoutHeight, 15);
+    }
+
+    function test_batchSend_ok_20(
+        uint64 timeoutTimestamp,
+        uint64 timeoutHeight
+    ) public {
+        vm.pauseGasMetering();
+        test_batchSend_ok(timeoutTimestamp, timeoutHeight, 20);
+    }
+
+    function test_batchSend_ok_25(
+        uint64 timeoutTimestamp,
+        uint64 timeoutHeight
+    ) public {
+        vm.pauseGasMetering();
+        test_batchSend_ok(timeoutTimestamp, timeoutHeight, 25);
+    }
+
+    function test_batchSend_ok_30(
+        uint64 timeoutTimestamp,
+        uint64 timeoutHeight
+    ) public {
+        vm.pauseGasMetering();
+        test_batchSend_ok(timeoutTimestamp, timeoutHeight, 30);
     }
 
     function test_batchSend_commitmentSaved(
@@ -1018,6 +1210,24 @@ contract IBCPacketTests is Test {
         return (msg_, acks);
     }
 
+    function test_batchAcks_afterRecvPacket_ok_2(
+        uint32 sourceChannel,
+        bytes calldata message,
+        bytes calldata ack
+    ) public {
+        vm.pauseGasMetering();
+        test_batchAcks_afterRecvPacket_ok(sourceChannel, message, 2, ack);
+    }
+
+    function test_batchAcks_afterRecvPacket_ok_5(
+        uint32 sourceChannel,
+        bytes calldata message,
+        bytes calldata ack
+    ) public {
+        vm.pauseGasMetering();
+        test_batchAcks_afterRecvPacket_ok(sourceChannel, message, 5, ack);
+    }
+
     function test_batchAcks_afterRecvPacket_ok_10(
         uint32 sourceChannel,
         bytes calldata message,
@@ -1025,6 +1235,42 @@ contract IBCPacketTests is Test {
     ) public {
         vm.pauseGasMetering();
         test_batchAcks_afterRecvPacket_ok(sourceChannel, message, 10, ack);
+    }
+
+    function test_batchAcks_afterRecvPacket_ok_15(
+        uint32 sourceChannel,
+        bytes calldata message,
+        bytes calldata ack
+    ) public {
+        vm.pauseGasMetering();
+        test_batchAcks_afterRecvPacket_ok(sourceChannel, message, 15, ack);
+    }
+
+    function test_batchAcks_afterRecvPacket_ok_20(
+        uint32 sourceChannel,
+        bytes calldata message,
+        bytes calldata ack
+    ) public {
+        vm.pauseGasMetering();
+        test_batchAcks_afterRecvPacket_ok(sourceChannel, message, 20, ack);
+    }
+
+    function test_batchAcks_afterRecvPacket_ok_25(
+        uint32 sourceChannel,
+        bytes calldata message,
+        bytes calldata ack
+    ) public {
+        vm.pauseGasMetering();
+        test_batchAcks_afterRecvPacket_ok(sourceChannel, message, 25, ack);
+    }
+
+    function test_batchAcks_afterRecvPacket_ok_30(
+        uint32 sourceChannel,
+        bytes calldata message,
+        bytes calldata ack
+    ) public {
+        vm.pauseGasMetering();
+        test_batchAcks_afterRecvPacket_ok(sourceChannel, message, 30, ack);
     }
 
     function test_batchAcks_afterRecvPacket_commitmentSaved(

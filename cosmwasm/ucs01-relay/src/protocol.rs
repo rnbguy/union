@@ -1,10 +1,9 @@
 use base58::{FromBase58, ToBase58};
 use cosmwasm_std::{
-    wasm_execute, Addr, AnyMsg, Attribute, BankMsg, Binary, Coin, CosmosMsg, DepsMut, Env,
-    HexBinary, IbcEndpoint, IbcOrder, IbcPacket, IbcReceiveResponse, MessageInfo, Uint128, Uint512,
+    wasm_execute, Addr, Attribute, BankMsg, Binary, Coin, CosmosMsg, DepsMut, Env, HexBinary,
+    IbcAcknowledgement, IbcEndpoint, IbcMsg, IbcOrder, IbcPacket, IbcReceiveResponse, MessageInfo,
+    Uint128, Uint512,
 };
-use prost::{Message, Name};
-use protos::deferredack::v1beta1::{DeferredPacketInfo, MsgWriteDeferredAck};
 use sha2::{Digest, Sha256};
 use token_factory_api::TokenFactoryMsg;
 use ucs01_relay_api::{
@@ -19,7 +18,7 @@ use ucs01_relay_api::{
         Ucs01TransferPacket,
     },
 };
-use unionlabs::{encoding, ibc::core::client::height::Height};
+use unionlabs::encoding;
 
 use crate::{
     contract::execute_transfer,
@@ -84,46 +83,11 @@ pub trait TransferProtocolExt<'a>:
             ),
         };
 
-        let packet_timeout_timestamp: u64 = refund_info
-            .origin_packet
-            .timeout
-            .timestamp()
-            .unwrap_or_default()
-            .nanos();
-        let packet_timeout_height = match refund_info.origin_packet.timeout.block() {
-            Some(timeout_block) => Height {
-                revision_number: timeout_block.revision,
-                revision_height: timeout_block.height,
-            },
-            None => Height {
-                revision_number: 0,
-                revision_height: 0,
-            },
-        };
-
-        let deferred_packet_into = DeferredPacketInfo {
-            refund_channel_id: refund_info.origin_packet.dest.channel_id,
-            refund_port_id: refund_info.origin_packet.dest.port_id,
-            packet_src_channel_id: refund_info.origin_packet.src.channel_id,
-            packet_src_port_id: refund_info.origin_packet.src.port_id,
-            packet_timeout_timestamp,
-            packet_timeout_height: packet_timeout_height.to_string(),
-            packet_data: refund_info.origin_packet.data.to_vec(),
-            sequence: refund_info.origin_packet.sequence,
-        };
-
-        let deferred_ack_msg = CosmosMsg::<Self::CustomMsg>::Any(AnyMsg {
-            type_url: MsgWriteDeferredAck::type_url(),
-            value: MsgWriteDeferredAck {
-                sender: self.self_addr().to_string(),
-                deferred_packet_info: Some(deferred_packet_into),
-                ack: ack_bytes,
-            }
-            .encode_to_vec()
-            .into(),
-        });
-
-        ack_msgs.push(deferred_ack_msg);
+        ack_msgs.push(CosmosMsg::Ibc(IbcMsg::WriteAcknowledgement {
+            channel_id: refund_info.origin_packet.dest.channel_id.clone(),
+            packet_sequence: refund_info.origin_packet.sequence,
+            ack: IbcAcknowledgement::new(ack_bytes),
+        }));
         ack_attrs.push(Attribute::new(ATTR_PFM, ATTR_VALUE_PFM_ACK.to_string()));
 
         IN_FLIGHT_PFM_PACKETS.remove(

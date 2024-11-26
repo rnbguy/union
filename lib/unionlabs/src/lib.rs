@@ -43,9 +43,6 @@ pub mod near;
 /// Defines types that wrap the IBC specification, matching the proto module structure. This also includes `union` extensions to ibc (i.e. types defined in `union.ibc`).
 pub mod ibc;
 
-/// Defines types that wrap the tendermint specification, matching the proto module structure.
-pub mod tendermint;
-
 /// Defines types that are extended from tendermint in cometbls
 pub mod cometbls;
 
@@ -72,9 +69,6 @@ pub mod aptos;
 
 /// Wrapper types around [`milagro_bls`] types, providing more conversions and a simpler signing interface.
 pub mod bls;
-
-/// Well-known events emitted by ibc-enabled chains.
-pub mod events;
 
 pub mod bounded;
 
@@ -105,6 +99,9 @@ pub(crate) mod macros;
 
 pub mod errors;
 
+#[cfg(feature = "proto")]
+pub use ::prost;
+
 #[cfg(any(feature = "test_utils", test))]
 #[allow(clippy::missing_panics_doc)]
 pub mod test_utils;
@@ -124,10 +121,20 @@ pub trait TypeUrl {
 #[cfg(feature = "ethabi")]
 #[derive(Debug, thiserror::Error)]
 pub enum TryFromEthAbiBytesError<E> {
-    #[error("unable to convert from the raw ethers type")]
-    TryFromEthAbi(#[source] E),
+    #[error(transparent)]
+    TryFromEthAbi(E),
     #[error("unable to decode from raw ethabi bytes")]
     Decode(ethers_core::abi::AbiError),
+}
+
+#[cfg(feature = "ethabi")]
+#[derive(Debug, thiserror::Error)]
+// TODO: Rename this once we fully remove ethers
+pub enum TryFromEthAbiBytesErrorAlloy<E> {
+    #[error(transparent)]
+    Convert(E),
+    #[error("unable to decode from raw ethabi bytes")]
+    Decode(#[from] alloy::core::sol_types::Error),
 }
 
 /// An empty string. Will only parse/serialize to/from `""`.

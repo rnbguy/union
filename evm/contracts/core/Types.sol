@@ -12,8 +12,6 @@ struct IBCConnection {
     uint32 clientId;
     uint32 counterpartyClientId;
     uint32 counterpartyConnectionId;
-    string clientType;
-    string counterpartyClientType;
 }
 
 enum IBCChannelState {
@@ -35,7 +33,8 @@ struct IBCChannel {
     IBCChannelOrder ordering;
     uint32 connectionId;
     uint32 counterpartyChannelId;
-    bytes32 version;
+    string counterpartyPortId;
+    string version;
 }
 
 struct IBCPacket {

@@ -1,11 +1,11 @@
 use ethereum_light_client::errors::{CanonicalizeStoredValueError, InvalidCommitmentKey};
 use ics008_wasm_client::IbcClientError;
 use scroll_codec::batch_header::BatchHeaderV3DecodeError;
+use scroll_light_client_types::{ClientState, ConsensusState};
 use unionlabs::{
     encoding::{DecodeErrorOf, Proto},
-    google::protobuf::any::Any,
     hash::H256,
-    ibc::{core::client::height::Height, lightclients::wasm},
+    ibc::core::client::height::Height,
     ics24::PathParseError,
 };
 
@@ -18,39 +18,30 @@ pub enum Error {
         #[source]
         DecodeErrorOf<Proto, unionlabs::ibc::lightclients::ethereum::storage_proof::StorageProof>,
     ),
-    #[error("unable to decode counterparty's stored cometbls client state")]
-    CometblsClientStateDecode(
-        #[source]
-        DecodeErrorOf<
-            Proto,
-            Any<unionlabs::ibc::lightclients::cometbls::client_state::ClientState>,
-        >,
-    ),
-    #[error("unable to decode counterparty's stored cometbls consensus state")]
-    CometblsConsensusStateDecode(
-        #[source]
-        DecodeErrorOf<
-            Proto,
-            Any<
-                wasm::consensus_state::ConsensusState<
-                    unionlabs::ibc::lightclients::cometbls::consensus_state::ConsensusState,
-                >,
-            >,
-        >,
-    ),
+    // #[error("unable to decode counterparty's stored cometbls client state")]
+    // CometblsClientStateDecode(
+    //     #[source]
+    //     DecodeErrorOf<
+    //         Proto,
+    //         Any<unionlabs::ibc::lightclients::cometbls::client_state::ClientState>,
+    //     >,
+    // ),
+    // #[error("unable to decode counterparty's stored cometbls consensus state")]
+    // CometblsConsensusStateDecode(
+    //     #[source]
+    //     DecodeErrorOf<
+    //         Proto,
+    //         Any<
+    //             wasm::consensus_state::ConsensusState<
+    //                 unionlabs::ibc::lightclients::cometbls::consensus_state::ConsensusState,
+    //             >,
+    //         >,
+    //     >,
+    // ),
     #[error("unable to decode client state")]
-    ClientStateDecode(
-        #[source]
-        DecodeErrorOf<Proto, unionlabs::ibc::lightclients::scroll::client_state::ClientState>,
-    ),
+    ClientStateDecode(#[source] DecodeErrorOf<Proto, ClientState>),
     #[error("unable to decode consensus state")]
-    ConsensusStateDecode(
-        #[source]
-        DecodeErrorOf<
-            Proto,
-            unionlabs::ibc::lightclients::scroll::consensus_state::ConsensusState,
-        >,
-    ),
+    ConsensusStateDecode(#[source] DecodeErrorOf<Proto, ConsensusState>),
 
     // REVIEW: Move this variant to IbcClientError?
     #[error("consensus state not found at height {0}")]

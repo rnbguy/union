@@ -1,11 +1,15 @@
 {
   description = "Union is a trust-minimized, zero-knowledge bridging protocol, designed for censorship resistance, extremely high security and usage in decentralized finance.";
   inputs = {
+    solc = {
+      url = "github:hellwolf/solc.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     nixpkgs.url = "github:NixOS/nixpkgs?rev=75a5ebf473cd60148ba9aec0d219f72e5cf52519";
     # Track a separate nixpkgs for latest solc
     nixpkgs-solc.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # We need the latest nixpkgs for buildGo121Module, remove this once we upgrade nixpkgs
-    nixpkgs-go.url = "github:NixOS/nixpkgs/nixos-23.11";
+    # We need the latest nixpkgs for buildGo123Module, remove this once we upgrade nixpkgs
+    nixpkgs-go.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Track a separate nixpkgs for unstable nixos
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Remove when lnav is updated on upstream nixpkgs
@@ -49,7 +53,7 @@
     };
 
     ibc-go = {
-      url = "github:cosmos/ibc-go?rev=c98311964dc550b9fe9a5bff8b6dd8e35bf13642";
+      url = "github:unionlabs/ibc-go-union?rev=4fbe0649cdf00d58090909bc4dfe5a7be32b013e";
       flake = false;
     };
     ics23 = {
@@ -57,7 +61,7 @@
       flake = false;
     };
     cosmosproto = {
-      url = "github:cosmos/cosmos-proto?rev=78e33f25b874e7639f540037599d8ea1d161a62c";
+      url = "github:cosmos/cosmos-proto?rev=0748a2ad4a5c78b1db6c8090db01e255bcc91365";
       flake = false;
     };
     gogoproto = {
@@ -69,7 +73,7 @@
       flake = false;
     };
     wasmd = {
-      url = "github:CosmWasm/wasmd?rev=7b418de3f6cf8fbac1e9cb11c57983fcc17264d0";
+      url = "github:unionlabs/wasmd?rev=913c24df4e0a7a3d791d27fc95313d559e9428b6";
       flake = false;
     };
     nix-filter.url = "github:numtide/nix-filter?rev=3449dc925982ad46246cfc36469baf66e1b64f17";
@@ -84,6 +88,10 @@
     };
     wasmvm-2_0_1 = {
       url = "github:CosmWasm/wasmvm/v2.0.1";
+      flake = false;
+    };
+    wasmvm-2_1_3 = {
+      url = "github:CosmWasm/wasmvm/v2.1.3";
       flake = false;
     };
     biome = {
@@ -117,15 +125,15 @@
     cometbls = {
       type = "github";
       owner = "unionlabs";
-      repo = "cometbls";
-      rev = "360766577f7daa89f958a4c28eee909340eb4b02";
+      repo = "cometbft";
+      rev = "40cbc598984d75fc4c8af1f100674dc459cda25d";
       flake = false;
     };
     cosmossdk = {
       type = "github";
       owner = "unionlabs";
-      repo = "cosmos-sdk";
-      rev = "7d067955f7028f45b3ce205b5c35aab2e1946b19";
+      repo = "cosmos-sdk-union";
+      rev = "c2982236c55751ea227679164594ce572bb857f3";
       flake = false;
     };
 
@@ -169,6 +177,7 @@
       googleapis,
       get-flake,
       wasmd,
+      solc,
       ...
     }:
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -307,9 +316,12 @@
               pkgs = nixpkgs.legacyPackages.${system}.appendOverlays (
                 with inputs;
                 [
+                  solc.overlay
                   rust-overlay.overlays.default
                   foundry.overlay
                   (_: super: {
+                    inherit (self'.packages) devnet-utils;
+
                     go-ethereum = super.go-ethereum.override {
                       buildGoModule =
                         args:
@@ -346,31 +358,20 @@
                       pkgs = super;
                     };
 
-                    inherit (self'.packages) devnet-utils;
                     solc =
                       if system == "aarch64-linux" then
-                        nixpkgs-solc.legacyPackages.${system}.solc.overrideAttrs (
-                          old:
-                          old
-                          // rec {
-                            version = "0.8.27";
-                            src = pkgs.fetchzip {
-                              url = "https://github.com/ethereum/solidity/releases/download/v${version}/solidity_${version}.tar.gz";
-                              sha256 = "sha256-koyoS/MsKpDECtVZ56bkQ6oUOft79HTJl/LZobGLmSk=";
-                            };
-                            postPatch = "";
-                          }
-                        )
-                      else
-                        super.stdenv.mkDerivation rec {
-                          pname = "solc-static";
+                        super.gccStdenv.mkDerivation rec {
+                          pname = "solc";
                           version = "0.8.27";
                           src = pkgs.fetchurl {
-                            url = "https://github.com/ethereum/solidity/releases/download/v${version}/solc-static-linux";
-                            hash = "sha256-uZd9UAwXy6bwAyypOe+YxN7PY2PxnzhtBfsC9wgRUmQ=";
+                            url = "https://github.com/nikitastupin/solc/raw/main/linux/aarch64/solc-v${version}";
+                            hash = "sha256-L5W7foccAyGJmcvINqByiDMJUYPuy0AOaVWKDvahCac=";
                           };
                           dontUnpack = true;
-                          nativeBuildInputs = pkgs.lib.optionals (!super.stdenv.isDarwin) [ super.autoPatchelfHook ];
+                          nativeBuildInputs = [
+                            super.stdenv.cc.cc.lib
+                            super.autoPatchelfHook
+                          ];
                           installPhase = ''
                             runHook preInstall
                             mkdir -p $out/bin
@@ -383,7 +384,9 @@
                             homepage = "https://github.com/ethereum/solidity";
                             license = super.lib.licenses.gpl3;
                           };
-                        };
+                        }
+                      else
+                        super.solc_0_8_27;
                   })
                 ]
               );
@@ -507,8 +510,8 @@
                 nodePackages_latest.typescript-language-server
                 nodePackages_latest.vscode-langservers-extracted
               ])
-              ++ (with goPkgs; [
-                go
+              ++ (with unstablePkgs; [
+                go_1_23
                 gopls
                 go-tools
                 gotools
@@ -542,6 +545,7 @@
 
             SQLX_OFFLINE = true;
             LIBCLANG_PATH = "${pkgs.llvmPackages_14.libclang.lib}/lib";
+            RUST_MIN_STACK = 16777216; # ICE fix: maybe related to https://github.com/rust-lang/rust/issues/131419
             PROTOC = "${pkgs.protobuf}/bin/protoc";
           };
           # https://flake.parts/options/treefmt-nix#opt-perSystem.treefmt

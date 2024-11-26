@@ -2,17 +2,17 @@
 
 use std::collections::BTreeMap;
 
+use cometbft_types::{
+    crypto::public_key::PublicKey,
+    types::{
+        block_id::BlockId, commit::Commit, commit_sig::CommitSig, signed_header::SignedHeader,
+        validator_set::ValidatorSet,
+    },
+};
+use tendermint_light_client_types::Fraction;
 use unionlabs::{
     google::protobuf::{duration::Duration, timestamp::Timestamp},
     hash::H160,
-    ibc::lightclients::tendermint::fraction::Fraction,
-    tendermint::{
-        crypto::public_key::PublicKey,
-        types::{
-            block_id::BlockId, commit::Commit, commit_sig::CommitSig, signed_header::SignedHeader,
-            validator_set::ValidatorSet,
-        },
-    },
 };
 
 use crate::{
@@ -540,7 +540,8 @@ mod tests {
     use std::{fs, num::NonZeroU64};
 
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    use unionlabs::{ibc::lightclients::tendermint::header::Header, option_unwrap};
+    use tendermint_light_client_types::Header;
+    use unionlabs::option_unwrap;
 
     use super::*;
 

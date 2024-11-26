@@ -1,12 +1,9 @@
 use ics008_wasm_client::IbcClientError;
+use movement_light_client_types::{ClientState, ConsensusState};
 use unionlabs::{
     aptos::storage_proof::TryFromStorageProofError,
     encoding::{DecodeErrorOf, Proto},
-    google::protobuf::any::Any,
-    ibc::{
-        core::client::height::Height,
-        lightclients::{cometbls, movement, wasm},
-    },
+    ibc::core::client::height::Height,
     TryFromProtoBytesError,
 };
 
@@ -15,9 +12,9 @@ use crate::client::MovementLightClient;
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum Error {
     #[error("unable to decode client state")]
-    ClientStateDecode(#[source] DecodeErrorOf<Proto, movement::client_state::ClientState>),
+    ClientStateDecode(#[source] DecodeErrorOf<Proto, ClientState>),
     #[error("unable to decode consensus state")]
-    ConsensusStateDecode(#[source] DecodeErrorOf<Proto, movement::consensus_state::ConsensusState>),
+    ConsensusStateDecode(#[source] DecodeErrorOf<Proto, ConsensusState>),
     #[error("error while calling custom query: {0}")]
     CustomQuery(#[from] unionlabs::cosmwasm::wasm::union::custom_query::Error),
     #[error("header verification failure ({0})")]
@@ -40,18 +37,18 @@ pub enum Error {
     StorageProofDecode(#[from] TryFromProtoBytesError<TryFromStorageProofError>),
     #[error("invalid ibc path {0}")]
     InvalidIbcPath(String),
-    #[error("unable to decode counterparty's stored cometbls client state")]
-    CometblsClientStateDecode(
-        #[source] DecodeErrorOf<Proto, Any<cometbls::client_state::ClientState>>,
-    ),
-    #[error("unable to decode counterparty's stored cometbls consensus state")]
-    CometblsConsensusStateDecode(
-        #[source]
-        DecodeErrorOf<
-            Proto,
-            Any<wasm::consensus_state::ConsensusState<cometbls::consensus_state::ConsensusState>>,
-        >,
-    ),
+    // #[error("unable to decode counterparty's stored cometbls client state")]
+    // CometblsClientStateDecode(
+    //     #[source] DecodeErrorOf<Proto, Any<cometbls::client_state::ClientState>>,
+    // ),
+    // #[error("unable to decode counterparty's stored cometbls consensus state")]
+    // CometblsConsensusStateDecode(
+    //     #[source]
+    //     DecodeErrorOf<
+    //         Proto,
+    //         Any<wasm::consensus_state::ConsensusState<cometbls::consensus_state::ConsensusState>>,
+    //     >,
+    // ),
 }
 
 impl From<Error> for IbcClientError<MovementLightClient> {
